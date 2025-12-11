@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>C3 P2P Tester</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body class="bg-gray-900 text-white overflow-hidden">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+        const createPeer = (id) => new Peer(id, { debug: 1 });
+
+        // --- HOST (АДМИН) ---
+        const HostView = () => {
+            const [peerId, setPeerId] = useState('');
+            const [zipFile, setZipFile] = useState(null);
+            const [status, setStatus] = useState('disconnected');
+            const [statusMsg, setStatusMsg] = useState('Initializing...');
+            const [remoteStream, setRemoteStream] = useState(null);
+            const [isValidating, setIsValidating] = useState(false);
+
+            const peerRef = useRef(null);
+            const connRef = useRef(null);
+            const videoRef = useRef(null);
+            const zipFileRef = useRef(null);
+
+            // создаём peer один раз
+            useEffect(() => {
+                const id = Math.random().toString(36).substring(2, 10);
+                const peer = createPeer(id);
+                peerRef.current = peer;
+
+                peer.on('open', (id) => {
+                    setPeerId(id);
+                    setStatusMsg('Ready. Select ZIP.');
+                });
+
+                peer.on('connection', (conn) => {
+                    connRef.current = conn;
+                    setStatus('connected');
+                    setStatusMsg('Tester connected!');
+
+                    conn.on('open', () => {
+                        const file = zipFileRef.current;
+                        if (file) {
+                            sendFile(conn, file);
+                        } else {
+                            setStatusMsg('Tester connected. Upload ZIP.');
+                        }
+                    });
+
+                    conn.on('close', () => {
+                        setStatus('disconnected');
+                        setStatusMsg('Tester disconnected.');
+                        setRemoteStream(null);
+                    });
+                });
+
+                // входящий медиастрим от тестера
+                peer.on('call', (call) => {
+                    call.answer();
+                    call.on('stream', (stream) => {
+                        setRemoteStream(stream);
+                        setStatus('playing');
+                        setStatusMsg('Receiving stream...');
+                    });
+                });
+
+                return () => {
+                    try { peer.destroy(); } catch (e) {}
+                    peerRef.current = null;
+                    connRef.current = null;
+                };
+            }, []);
+
+            // когда есть stream и видео-элемент — навешиваем srcObject
+            useEffect(() => {
+                if (videoRef.current && remoteStream) {
+                    videoRef.current.srcObject = remoteStream;
+                }
+            }, [remoteStream]);
+
+            const handleFile = async (e) => {
+                const file = e.target.files?.[0];
+                if (!file) return;
+
+                setIsValidating(true);
+                try {
+                    const zip = await JSZip.loadAsync(file);
+                    const hasIndex = Object.keys(zip.files).some(p =>
+                        p.toLowerCase().endsWith('index.html')
+                    );
+                    if (!hasIndex) {
+                        alert('No index.html found!');
+                        setIsValidating(false);
+                        return;
+                    }
+
+                    setZipFile(file);
+                    zipFileRef.current = file;
+                    setStatusMsg('Verified! Share link.');
+
+                    if (connRef.current && connRef.current.open) {
+                        await sendFile(connRef.current, file);
+                    }
+                } catch (err) {
+                    console.error(err);
+                    alert('Invalid ZIP');
+                }
+                setIsValidating(false);
+            };
+
+            const sendFile = async (conn, file) => {
+                if (!conn || !conn.open || !file) return;
+
+                setStatus('transferring');
+                setStatusMsg(`Sending ${file.name}...`);
+
+                conn.send({
+                    type: 'meta',
+                    filename: file.name,
+                    size: file.size,
+                    mime: file.type,
+                });
+
+                await new Promise(r => setTimeout(r, 300));
+
+                const buffer = await file.arrayBuffer();
+                conn.send(buffer);
+
+                setStatus('playing');
+                setStatusMsg('Sent. Waiting for stream...');
+            };
+
+            const link = peerId
+                ? `${window.location.origin}${window.location.pathname}#/play?host=${peerId}`
+                : '...';
+
+            return (
+                <div className="min-h-screen p-4 flex flex-col items-center">
+                    <div className="w-full max-w-6xl mx-auto flex flex-col gap-4 font-sans">
+                        {/* Верхняя полоса: загрузка + линк + статус */}
+                        <div className="w-full bg-gray-800 p-3 rounded-xl border border-gray-700 flex items-center gap-4">
+                            {/* Загрузка ZIP */}
+                            <label className="flex-1 max-w-xs block px-3 py-2 border-2 border-dashed border-gray-600 rounded-lg text-center cursor-pointer hover:border-blue-500">
+                                <input
+                                    type="file"
+                                    onChange={handleFile}
+                                    className="hidden"
+                                    accept=".zip"
+                                />
+                                <div className="text-2xl mb-1">
+                                    {zipFile ? '✅' : (isValidating ? '⏳' : '📂')}
+                                </div>
+                                <span className="text-xs truncate block">
+                                    {zipFile ? zipFile.name : "Select Game ZIP"}
+                                </span>
+                            </label>
+
+                            {/* Линк + статус */}
+                            <div className="flex-1 flex flex-col gap-1">
+                                <div className="flex gap-2">
+                                    <input
+                                        readOnly
+                                        value={zipFile ? link : '...'}
+                                        className="bg-black/50 border border-gray-600 rounded px-2 py-1 w-full text-xs"
+                                    />
+                                    <button
+                                        onClick={() => zipFile && navigator.clipboard.writeText(link)}
+                                        className="bg-blue-600 px-3 py-1 rounded text-sm"
+                                    >
+                                        📋
+                                    </button>
+                                </div>
+                                <div className="text-xs text-gray-400">
+                                    {statusMsg}
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* Окно превью стрима, больше и по центру */}
+                        <div className="w-full flex-1 flex items-center justify-center">
+                            <div className="w-full max-w-6xl aspect-video bg-black rounded-xl border border-gray-700 overflow-hidden flex items-center justify-center relative">
+                                {remoteStream ? (
+                                    <div className="relative w-full h-full">
+                                        <video
+                                            ref={videoRef}
+                                            className="w-full h-full object-contain"
+                                            autoPlay
+                                            playsInline
+                                            style={{ imageRendering: 'crisp-edges' }}
+                                        />
+                                    </div>
+                                ) : (
+                                    <div className="text-gray-500 text-center text-sm">
+                                        <div className="text-4xl mb-2">📺</div>
+                                        Waiting for stream...
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        // --- TESTER (ИГРОК) ---
+        const TesterView = ({ hostId }) => {
+            const [msg, setMsg] = useState('Connecting...');
+            const [isReady, setIsReady] = useState(false);
+            const [isSharing, setIsSharing] = useState(false);
+            const [downloadProgress, setDownloadProgress] = useState(0);
+
+            const peerRef = useRef(null);
+            const iframeRef = useRef(null);
+            const callRef = useRef(null);
+
+            useEffect(() => {
+                const peer = createPeer();
+                peerRef.current = peer;
+
+                peer.on('open', () => {
+                    const conn = peer.connect(hostId);
+
+                    conn.on('open', () => {
+                        setMsg('Connected! Waiting for data...');
+                    });
+
+                    conn.on('data', async (data) => {
+                        if (data && data.type === 'meta') {
+                            // Просто текст Downloading game...
+                            setDownloadProgress(0);
+                            setMsg('Downloading game...');
+                        } else {
+                            // данные получены полностью, всё ещё показываем Downloading game...
+                            setDownloadProgress(100);
+                            setMsg('Downloading game...');
+                            await processZip(data);
+                        }
+                    });
+
+                    conn.on('close', () => {
+                        setMsg('Host disconnected');
+                    });
+                });
+
+                return () => {
+                    try { peer.destroy(); } catch (e) {}
+                    peerRef.current = null;
+                };
+            }, [hostId]);
+
+            const processZip = async (data) => {
+                try {
+                    const zip = await JSZip.loadAsync(data);
+                    const files = [];
+                    let hasIndex = false;
+
+                    const promises = Object.keys(zip.files).map(async (path) => {
+                        const entry = zip.files[path];
+                        if (entry.dir) return;
+
+                        let blob = await entry.async('blob');
+
+                        // Патчим index.html (WebGL / SW)
+                        if (path.toLowerCase().endsWith('index.html')) {
+                            let text = await blob.text();
+
+                            const patch = `
+                            <script>
+                              (function() {
+                                console.log("⚠️ WEBGL PATCHER STARTED ⚠️");
+                                if (navigator.serviceWorker) {
+                                  navigator.serviceWorker.register = function() {
+                                    return new Promise(function() {});
+                                  };
+                                }
+                                const oldGetContext = HTMLCanvasElement.prototype.getContext;
+                                HTMLCanvasElement.prototype.getContext = function(type, options) {
+                                  options = options || {};
+                                  if (type === 'webgl' || type === 'webgl2') {
+                                    options.preserveDrawingBuffer = true;
+                                    options.alpha = false;
+                                    options.stencil = true;
+                                  }
+                                  return oldGetContext.call(this, type, options);
+                                };
+                              })();
+                            <\/script>`;
+
+                            if (text.includes('<head>')) {
+                                text = text.replace('<head>', '<head>' + patch);
+                            } else {
+                                text = patch + text;
+                            }
+
+                            blob = new Blob([text], { type: 'text/html' });
+                            hasIndex = true;
+                        }
+
+                        files.push({ path, blob });
+                    });
+
+                    await Promise.all(promises);
+
+                    if (!hasIndex) {
+                        setMsg('Error: No index.html');
+                        return;
+                    }
+
+                    if (!('serviceWorker' in navigator)) {
+                        setMsg('Service Worker not supported');
+                        return;
+                    }
+
+                    const reg = await navigator.serviceWorker.register('./worker.js', { scope: '/' });
+                    await reg.update();
+
+                    const waitForController = () => {
+                        if (navigator.serviceWorker.controller) return Promise.resolve();
+                        return new Promise(resolve => {
+                            navigator.serviceWorker.addEventListener('controllerchange', () => resolve(), { once: true });
+                        });
+                    };
+
+                    setMsg('Activating Environment...');
+                    await waitForController();
+
+                    const onMessage = (e) => {
+                        if (e.data && e.data.type === 'CACHE_COMPLETE') {
+                            setIsReady(true);
+                            setMsg('');
+                            navigator.serviceWorker.removeEventListener('message', onMessage);
+                        }
+                    };
+
+                    navigator.serviceWorker.addEventListener('message', onMessage);
+
+                    navigator.serviceWorker.controller.postMessage({
+                        type: 'CACHE_FILES',
+                        files,
+                    });
+                } catch (e) {
+                    console.error(e);
+                    setMsg('Error processing file.');
+                }
+            };
+
+            // Стримим через getDisplayMedia (экран/вкладка) — максимум качества и есть звук
+            const startScreenShare = async () => {
+                if (!peerRef.current) return;
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+                    alert('Screen Share API not supported in this browser.');
+                    return;
+                }
+
+                try {
+                    setIsSharing(true);
+
+                    const stream = await navigator.mediaDevices.getDisplayMedia({
+                        video: { frameRate: 60 },
+                        audio: true,
+                    });
+
+                    const videoTrack = stream.getVideoTracks()[0];
+                    if (videoTrack) {
+                        videoTrack.addEventListener('ended', () => {
+                            setIsSharing(false);
+                            callRef.current && callRef.current.close();
+                        });
+                    }
+
+                    const call = peerRef.current.call(hostId, stream);
+                    callRef.current = call;
+                } catch (err) {
+                    console.error('getDisplayMedia error', err);
+                    setIsSharing(false);
+                    if (!err || err.name !== 'AbortError') {
+                        alert('Failed to start screen sharing.');
+                    }
+                }
+            };
+
+            // Авто-запрос на шаринг, когда игра готова (без кнопки)
+            useEffect(() => {
+                if (isReady) {
+                    startScreenShare();
+                }
+            }, [isReady]);
+
+            if (isReady) {
+                return (
+                    <div className="w-screen h-screen bg-black relative">
+                        <iframe
+                            ref={iframeRef}
+                            src="/game/index.html"
+                            className="w-full h-full border-0 block"
+                            allow="autoplay; fullscreen; gamepad; accelerometer; gyroscope"
+                        />
+                    </div>
+                );
+            }
+
+            return (
+                <div className="min-h-screen bg-black flex flex-col items-center justify-center text-center p-4 text-white">
+                    <div className="text-4xl mb-4 animate-bounce">🎮</div>
+                    <h1 className="text-2xl font-bold mb-2">{msg}</h1>
+                    <p className="text-gray-500 text-sm">Do not close this tab</p>
+                </div>
+            );
+        };
+
+        const App = () => {
+            const [route, setRoute] = useState('host');
+            const [hostId, setHostId] = useState('');
+
+            useEffect(() => {
+                const check = () => {
+                    const hash = window.location.hash;
+                    if (hash.includes('/play')) {
+                        const id = new URLSearchParams(hash.split('?')[1] || '').get('host');
+                        if (id) {
+                            setHostId(id);
+                            setRoute('play');
+                            return;
+                        }
+                    }
+                    setRoute('host');
+                };
+                check();
+                window.addEventListener('hashchange', check);
+                return () => window.removeEventListener('hashchange', check);
+            }, []);
+
+            return route === 'play' ? <TesterView hostId={hostId} /> : <HostView />;
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
