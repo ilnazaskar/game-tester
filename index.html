@@ -21,6 +21,7 @@
 
   const createPeer = (id) => new Peer(id, { debug: 1 });
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const clamp01 = (v) => Math.max(0, Math.min(1, v));
 
   // =========================
   // ZIP chunk transfer helpers
@@ -34,7 +35,7 @@
     dv.setUint32(0, chunkIndex);
     dv.setUint32(4, totalChunks);
     out.set(payloadU8, 8);
-    return out; // Uint8Array
+    return out;
   };
 
   const toArrayBuffer = async (data) => {
@@ -96,8 +97,6 @@
   // =========================
   // Host overlay mapping helpers
   // =========================
-  const clamp01 = (v) => Math.max(0, Math.min(1, v));
-
   const computeContainedRect = (containerW, containerH, videoW, videoH) => {
     if (!containerW || !containerH || !videoW || !videoH) {
       return { x: 0, y: 0, w: containerW || 0, h: containerH || 0 };
@@ -186,6 +185,7 @@
 
             if (data.type === 'input' && data.payload) {
               const p = data.payload;
+
               if (p.kind === 'cursor') {
                 setCursor({
                   visible: !!p.visible,
@@ -195,6 +195,7 @@
                 });
                 return;
               }
+
               if (p.kind === 'click') {
                 const id = (crypto?.randomUUID?.() || String(Math.random()));
                 setClickPulse({ x: clamp01(p.x ?? 0.5), y: clamp01(p.y ?? 0.5), id });
@@ -415,12 +416,16 @@
                       playsInline
                       style={{ imageRendering: 'crisp-edges' }}
                     />
+
+                    {/* cursor */}
                     {cursor.visible && (
                       <div
                         className="absolute w-4 h-4 rounded-full border border-white/80 bg-white/20 pointer-events-none"
                         style={cursorStyle}
                       />
                     )}
+
+                    {/* click pulse */}
                     {clickPulse && pulseStyle && (
                       <div
                         className="absolute w-14 h-14 rounded-full border-2 border-white/60 pointer-events-none animate-ping"
@@ -476,7 +481,7 @@
 
                   return (
                     <div key={l.id} className={`rounded mb-1 ${bg} border border-white/5`}>
-                      <details className="group">
+                      <details>
                         <summary className="cursor-pointer select-none px-2 py-1 flex gap-2 items-start">
                           <span className="text-gray-400 shrink-0">{time}</span>
                           <span className={`shrink-0 uppercase ${levelColor}`}>{l.level}</span>
@@ -519,10 +524,12 @@
     const recvChunksRef = useRef(null);
     const recvCountRef = useRef(0);
 
+    // logs batching
     const logQueueRef = useRef([]);
     const logSeqRef = useRef(0);
     const flushTimerRef = useRef(null);
 
+    // input throttling
     const lastCursorSendRef = useRef(0);
 
     useEffect(() => {
@@ -660,15 +667,15 @@
         const patchIntoIndex = async (blob) => {
           let text = await blob.text();
 
-          // Adds:
-          // - safe SW block
-          // - WebGL patch
-          // - console forwarder
-          // - AUTO FULLSCREEN on mobile: re-enter on every tap if not fullscreen
+          // Patch:
+          // - Safe internal SW register
+          // - WebGL tweaks
+          // - Console forwarder
+          // - Soft fullscreen (no forced orientation, uses body, re-enters on next tap)
           const patch = `
 <script>
 (function() {
-  // Safe internal SW register block
+  // --- Safe internal SW register block ---
   try {
     if (navigator.serviceWorker && navigator.serviceWorker.register) {
       const orig = navigator.serviceWorker.register.bind(navigator.serviceWorker);
@@ -684,7 +691,7 @@
     }
   } catch(e) {}
 
-  // WebGL tweaks
+  // --- WebGL tweaks ---
   try {
     const oldGetContext = HTMLCanvasElement.prototype.getContext;
     HTMLCanvasElement.prototype.getContext = function(type, options) {
@@ -698,7 +705,7 @@
     };
   } catch(e) {}
 
-  // Console forwarder
+  // --- Console forwarder ---
   try {
     const send = function(level, args) {
       try {
@@ -754,22 +761,23 @@
     });
   } catch(e) {}
 
-  // Auto fullscreen on every tap if not fullscreen (mobile-friendly)
+  // --- Soft fullscreen (NO forced orientation) ---
   try {
-    const root = document.documentElement;
-
-    const reqFS = function() {
+    const requestSafeFullscreen = function() {
       try {
         const isFs = !!(document.fullscreenElement || document.webkitFullscreenElement);
         if (isFs) return;
-        const fn = root.requestFullscreen || root.webkitRequestFullscreen;
-        if (fn) fn.call(root);
+
+        const el = document.body || document.documentElement;
+        const fn = el.requestFullscreen || el.webkitRequestFullscreen || el.webkitEnterFullscreen;
+        if (fn) fn.call(el);
       } catch(e) {}
     };
 
-    // pointerdown/touchstart qualifies as user gesture
-    document.addEventListener('pointerdown', reqFS, { passive: true, capture: true });
-    document.addEventListener('touchstart', reqFS, { passive: true, capture: true });
+    // Every tap tries to enter fullscreen if not already.
+    // If user exits fullscreen, next tap re-enters.
+    document.addEventListener('pointerdown', requestSafeFullscreen, { passive: true, capture: true });
+    document.addEventListener('touchstart', requestSafeFullscreen, { passive: true, capture: true });
   } catch(e) {}
 })();
 <\/script>`;
@@ -829,16 +837,23 @@
     };
 
     const placeCallWithBitrate = async (stream) => {
-      try { const vt = stream.getVideoTracks?.()[0]; if (vt) vt.contentHint = 'detail'; } catch (e) {}
+      try {
+        const vt = stream.getVideoTracks?.()[0];
+        if (vt) vt.contentHint = 'detail';
+      } catch (e) {}
+
       const call = peerRef.current.call(hostId, stream);
       callRef.current = call;
-      setTimeout(() => setCallBitrate(call, { maxKbps: 8000, minKbps: 2000, maxFramerate: 60, scaleDown: 1.0 }), 250);
+
+      setTimeout(() => {
+        setCallBitrate(call, { maxKbps: 8000, minKbps: 2000, maxFramerate: 60, scaleDown: 1.0 });
+      }, 250);
     };
 
     const startStreaming = async () => {
       if (!peerRef.current) return;
 
-      // canvas.captureStream
+      // 1) Prefer canvas.captureStream everywhere
       try {
         const iframe = iframeRef.current;
         const doc = iframe?.contentDocument || iframe?.contentWindow?.document;
@@ -852,21 +867,23 @@
         }
       } catch (e) {}
 
-      // display media fallback
+      // 2) Fallback (desktop)
       if (navigator.mediaDevices?.getDisplayMedia) {
         try {
           const stream = await navigator.mediaDevices.getDisplayMedia({
             video: { frameRate: 60, width: { ideal: 1920 }, height: { ideal: 1080 } },
             audio: true
           });
+
           const vt = stream.getVideoTracks()[0];
           if (vt) vt.addEventListener('ended', () => callRef.current && callRef.current.close());
+
           await placeCallWithBitrate(stream);
         } catch (e) {}
       }
     };
 
-    // Receive logs from iframe (postMessage)
+    // Receive logs from iframe via postMessage
     useEffect(() => {
       const onMsg = (ev) => {
         const d = ev.data;
@@ -886,7 +903,7 @@
       return () => window.removeEventListener('message', onMsg);
     }, []);
 
-    // ✅ FIX: listen INSIDE iframe (events do not bubble to <iframe> element)
+    // ✅ Input forwarding FIX (correct coordinates)
     const cleanupInputRef = useRef(null);
 
     const attachInputListenersInsideIframe = () => {
@@ -895,42 +912,44 @@
       const doc = iframe?.contentDocument || win?.document;
       if (!iframe || !win || !doc) return null;
 
-      const getNormFromClient = (clientX, clientY) => {
-        const rect = iframe.getBoundingClientRect();
-        const x = clamp01((clientX - rect.left) / rect.width);
-        const y = clamp01((clientY - rect.top) / rect.height);
-        return { x, y };
+      const norm = (clientX, clientY) => {
+        const w = win.innerWidth || 1;
+        const h = win.innerHeight || 1;
+        return {
+          x: clamp01(clientX / w),
+          y: clamp01(clientY / h),
+        };
       };
 
-      const sendCursor = (clientX, clientY) => {
+      const sendCursor = (clientX, clientY, device = 'mouse') => {
         const now = performance.now();
         if (now - lastCursorSendRef.current < 16) return; // ~60fps
         lastCursorSendRef.current = now;
 
-        const { x, y } = getNormFromClient(clientX, clientY);
-        sendInput({ kind: 'cursor', visible: true, x, y, device: 'mouse' });
+        const { x, y } = norm(clientX, clientY);
+        sendInput({ kind: 'cursor', visible: true, x, y, device });
       };
 
       const onPointerMove = (e) => {
         if (e.pointerType === 'mouse' || e.pointerType === 'pen') {
-          sendCursor(e.clientX, e.clientY);
+          sendCursor(e.clientX, e.clientY, e.pointerType);
         }
       };
 
       const onPointerDown = (e) => {
-        const { x, y } = getNormFromClient(e.clientX, e.clientY);
+        const { x, y } = norm(e.clientX, e.clientY);
         sendInput({ kind: 'click', x, y, device: e.pointerType || 'pointer', button: e.button });
-      };
-
-      const onMouseLeaveWindow = () => {
-        sendInput({ kind: 'cursor', visible: false, x: 0.5, y: 0.5, device: 'mouse' });
       };
 
       const onTouchStart = (e) => {
         const t = e.touches && e.touches[0];
         if (!t) return;
-        const { x, y } = getNormFromClient(t.clientX, t.clientY);
+        const { x, y } = norm(t.clientX, t.clientY);
         sendInput({ kind: 'click', x, y, device: 'touch' });
+      };
+
+      const onLeave = () => {
+        sendInput({ kind: 'cursor', visible: false, x: 0.5, y: 0.5, device: 'mouse' });
       };
 
       // capture=true to catch even if game stops propagation
@@ -938,21 +957,18 @@
       doc.addEventListener('pointerdown', onPointerDown, { passive: true, capture: true });
       doc.addEventListener('touchstart', onTouchStart, { passive: true, capture: true });
 
-      win.addEventListener('blur', onMouseLeaveWindow, { passive: true });
-      win.addEventListener('mouseout', onMouseLeaveWindow, { passive: true });
+      win.addEventListener('blur', onLeave, { passive: true });
 
       return () => {
         doc.removeEventListener('pointermove', onPointerMove, true);
         doc.removeEventListener('pointerdown', onPointerDown, true);
         doc.removeEventListener('touchstart', onTouchStart, true);
-
-        win.removeEventListener('blur', onMouseLeaveWindow);
-        win.removeEventListener('mouseout', onMouseLeaveWindow);
+        win.removeEventListener('blur', onLeave);
       };
     };
 
     const handleGameLoaded = () => {
-      // attach input listeners
+      // attach inputs
       if (cleanupInputRef.current) {
         try { cleanupInputRef.current(); } catch {}
         cleanupInputRef.current = null;
