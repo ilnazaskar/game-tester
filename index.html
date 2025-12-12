@@ -1,451 +1,1034 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>C3 P2P Tester</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
-    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
-    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>C3 P2P Tester</title>
+
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 </head>
+
 <body class="bg-gray-900 text-white overflow-hidden">
-    <div id="root"></div>
+<div id="root"></div>
 
-    <script type="text/babel">
-        const { useState, useEffect, useRef } = React;
-        const createPeer = (id) => new Peer(id, { debug: 1 });
+<script type="text/babel">
+  const { useState, useEffect, useRef, useMemo } = React;
 
-        // --- HOST (АДМИН) ---
-        const HostView = () => {
-            const [peerId, setPeerId] = useState('');
-            const [zipFile, setZipFile] = useState(null);
-            const [status, setStatus] = useState('disconnected');
-            const [statusMsg, setStatusMsg] = useState('Initializing...');
-            const [remoteStream, setRemoteStream] = useState(null);
-            const [isValidating, setIsValidating] = useState(false);
+  const createPeer = (id) => new Peer(id, { debug: 1 });
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-            const peerRef = useRef(null);
-            const connRef = useRef(null);
-            const videoRef = useRef(null);
-            const zipFileRef = useRef(null);
+  // =========================
+  // ZIP chunk transfer helpers
+  // =========================
+  const CHUNK_SIZE = 128 * 1024;
+  const BUFFER_HIGH_WATERMARK = 2 * 1024 * 1024;
 
-            // создаём peer один раз
-            useEffect(() => {
-                const id = Math.random().toString(36).substring(2, 10);
-                const peer = createPeer(id);
-                peerRef.current = peer;
+  const makeChunkPacket = (chunkIndex, totalChunks, payloadU8) => {
+    const out = new Uint8Array(8 + payloadU8.byteLength);
+    const dv = new DataView(out.buffer, out.byteOffset, out.byteLength);
+    dv.setUint32(0, chunkIndex);
+    dv.setUint32(4, totalChunks);
+    out.set(payloadU8, 8);
+    return out; // Uint8Array
+  };
 
-                peer.on('open', (id) => {
-                    setPeerId(id);
-                    setStatusMsg('Ready. Select ZIP.');
-                });
+  const toArrayBuffer = async (data) => {
+    if (!data) return null;
+    if (data instanceof ArrayBuffer) return data;
+    if (data instanceof Blob) return await data.arrayBuffer();
+    if (ArrayBuffer.isView(data)) {
+      return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+    }
+    return null;
+  };
 
-                peer.on('connection', (conn) => {
-                    connRef.current = conn;
-                    setStatus('connected');
-                    setStatusMsg('Tester connected!');
+  const parseChunkPacket = (ab) => {
+    if (!(ab instanceof ArrayBuffer) || ab.byteLength < 8) return null;
+    const dv = new DataView(ab);
+    const chunkIndex = dv.getUint32(0);
+    const totalChunks = dv.getUint32(4);
+    const payload = ab.slice(8);
+    return { chunkIndex, totalChunks, payload };
+  };
 
-                    conn.on('open', () => {
-                        const file = zipFileRef.current;
-                        if (file) {
-                            sendFile(conn, file);
-                        } else {
-                            setStatusMsg('Tester connected. Upload ZIP.');
-                        }
-                    });
+  const waitDrain = async (conn) => {
+    const dc = conn?._dc;
+    if (!dc) return;
+    while (dc.bufferedAmount > BUFFER_HIGH_WATERMARK) {
+      await sleep(10);
+    }
+  };
 
-                    conn.on('close', () => {
-                        setStatus('disconnected');
-                        setStatusMsg('Tester disconnected.');
-                        setRemoteStream(null);
-                    });
-                });
+  // =========================
+  // WebRTC bitrate helper
+  // =========================
+  const setCallBitrate = async (call, {
+    maxKbps = 8000,
+    minKbps = 2000,
+    maxFramerate = 60,
+    scaleDown = 1.0
+  } = {}) => {
+    try {
+      const pc = call?.peerConnection;
+      if (!pc) return;
+      const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+      if (!sender) return;
 
-                // входящий медиастрим от тестера
-                peer.on('call', (call) => {
-                    call.answer();
-                    call.on('stream', (stream) => {
-                        setRemoteStream(stream);
-                        setStatus('playing');
-                        setStatusMsg('Receiving stream...');
-                    });
-                });
+      const params = sender.getParameters();
+      if (!params.encodings) params.encodings = [{}];
 
-                return () => {
-                    try { peer.destroy(); } catch (e) {}
-                    peerRef.current = null;
-                    connRef.current = null;
-                };
-            }, []);
+      params.encodings[0].maxBitrate = Math.floor(maxKbps * 1000);
+      params.encodings[0].minBitrate = Math.floor(minKbps * 1000);
+      params.encodings[0].maxFramerate = maxFramerate;
+      params.encodings[0].scaleResolutionDownBy = scaleDown;
 
-            // когда есть stream и видео-элемент — навешиваем srcObject
-            useEffect(() => {
-                if (videoRef.current && remoteStream) {
-                    videoRef.current.srcObject = remoteStream;
-                }
-            }, [remoteStream]);
+      await sender.setParameters(params);
+    } catch (e) {
+      console.warn('[RTC] setParameters failed', e);
+    }
+  };
 
-            const handleFile = async (e) => {
-                const file = e.target.files?.[0];
-                if (!file) return;
+  // =========================
+  // Host overlay mapping helpers
+  // =========================
+  const clamp01 = (v) => Math.max(0, Math.min(1, v));
 
-                setIsValidating(true);
-                try {
-                    const zip = await JSZip.loadAsync(file);
-                    const hasIndex = Object.keys(zip.files).some(p =>
-                        p.toLowerCase().endsWith('index.html')
-                    );
-                    if (!hasIndex) {
-                        alert('No index.html found!');
-                        setIsValidating(false);
-                        return;
-                    }
+  const computeContainedRect = (containerW, containerH, videoW, videoH) => {
+    if (!containerW || !containerH || !videoW || !videoH) {
+      return { x: 0, y: 0, w: containerW || 0, h: containerH || 0 };
+    }
+    const containerAR = containerW / containerH;
+    const videoAR = videoW / videoH;
 
-                    setZipFile(file);
-                    zipFileRef.current = file;
-                    setStatusMsg('Verified! Share link.');
+    if (videoAR > containerAR) {
+      const w = containerW;
+      const h = w / videoAR;
+      const x = 0;
+      const y = (containerH - h) / 2;
+      return { x, y, w, h };
+    } else {
+      const h = containerH;
+      const w = h * videoAR;
+      const x = (containerW - w) / 2;
+      const y = 0;
+      return { x, y, w, h };
+    }
+  };
 
-                    if (connRef.current && connRef.current.open) {
-                        await sendFile(connRef.current, file);
-                    }
-                } catch (err) {
-                    console.error(err);
-                    alert('Invalid ZIP');
-                }
-                setIsValidating(false);
-            };
+  // =========================
+  // HOST (АДМИН)
+  // =========================
+  const HostView = () => {
+    const [peerId, setPeerId] = useState('');
+    const [zipFile, setZipFile] = useState(null);
+    const [statusMsg, setStatusMsg] = useState('Initializing...');
+    const [remoteStream, setRemoteStream] = useState(null);
+    const [isValidating, setIsValidating] = useState(false);
 
-            const sendFile = async (conn, file) => {
-                if (!conn || !conn.open || !file) return;
+    const [logs, setLogs] = useState([]);
+    const [cursor, setCursor] = useState({ visible: false, x: 0.5, y: 0.5, device: 'mouse' });
+    const [clickPulse, setClickPulse] = useState(null);
 
-                setStatus('transferring');
-                setStatusMsg(`Sending ${file.name}...`);
+    const peerRef = useRef(null);
+    const connRef = useRef(null);
+    const videoRef = useRef(null);
+    const zipFileRef = useRef(null);
 
-                conn.send({
-                    type: 'meta',
-                    filename: file.name,
-                    size: file.size,
-                    mime: file.type,
-                });
+    const consoleRef = useRef(null);
+    const videoWrapRef = useRef(null);
+    const [videoMeta, setVideoMeta] = useState({ vw: 0, vh: 0 });
+    const [wrapSize, setWrapSize] = useState({ w: 0, h: 0 });
 
-                await new Promise(r => setTimeout(r, 300));
+    const shouldAutoScrollRef = useRef(true);
 
-                const buffer = await file.arrayBuffer();
-                conn.send(buffer);
+    useEffect(() => {
+      const id = Math.random().toString(36).substring(2, 10);
+      const peer = createPeer(id);
+      peerRef.current = peer;
 
-                setStatus('playing');
-                setStatusMsg('Sent. Waiting for stream...');
-            };
+      peer.on('open', (id) => {
+        setPeerId(id);
+        setStatusMsg('Ready. Select ZIP.');
+      });
 
-            const link = peerId
-                ? `${window.location.origin}${window.location.pathname}#/play?host=${peerId}`
-                : '...';
+      peer.on('connection', (conn) => {
+        connRef.current = conn;
+        try { conn.binaryType = 'arraybuffer'; } catch (e) {}
 
-            return (
-                <div className="min-h-screen p-4 flex flex-col items-center">
-                    <div className="w-full max-w-6xl mx-auto flex flex-col gap-4 font-sans">
-                        {/* Верхняя полоса: загрузка + линк + статус */}
-                        <div className="w-full bg-gray-800 p-3 rounded-xl border border-gray-700 flex items-center gap-4">
-                            {/* Загрузка ZIP */}
-                            <label className="flex-1 max-w-xs block px-3 py-2 border-2 border-dashed border-gray-600 rounded-lg text-center cursor-pointer hover:border-blue-500">
-                                <input
-                                    type="file"
-                                    onChange={handleFile}
-                                    className="hidden"
-                                    accept=".zip"
-                                />
-                                <div className="text-2xl mb-1">
-                                    {zipFile ? '✅' : (isValidating ? '⏳' : '📂')}
-                                </div>
-                                <span className="text-xs truncate block">
-                                    {zipFile ? zipFile.name : "Select Game ZIP"}
-                                </span>
-                            </label>
+        setStatusMsg('Tester connected!');
 
-                            {/* Линк + статус */}
-                            <div className="flex-1 flex flex-col gap-1">
-                                <div className="flex gap-2">
-                                    <input
-                                        readOnly
-                                        value={zipFile ? link : '...'}
-                                        className="bg-black/50 border border-gray-600 rounded px-2 py-1 w-full text-xs"
-                                    />
-                                    <button
-                                        onClick={() => zipFile && navigator.clipboard.writeText(link)}
-                                        className="bg-blue-600 px-3 py-1 rounded text-sm"
-                                    >
-                                        📋
-                                    </button>
-                                </div>
-                                <div className="text-xs text-gray-400">
-                                    {statusMsg}
-                                </div>
-                            </div>
-                        </div>
+        conn.on('open', async () => {
+          try { conn.binaryType = 'arraybuffer'; } catch (e) {}
 
-                        {/* Окно превью стрима, больше и по центру */}
-                        <div className="w-full flex-1 flex items-center justify-center">
-                            <div className="w-full max-w-6xl aspect-video bg-black rounded-xl border border-gray-700 overflow-hidden flex items-center justify-center relative">
-                                {remoteStream ? (
-                                    <div className="relative w-full h-full">
-                                        <video
-                                            ref={videoRef}
-                                            className="w-full h-full object-contain"
-                                            autoPlay
-                                            playsInline
-                                            style={{ imageRendering: 'crisp-edges' }}
-                                        />
-                                    </div>
-                                ) : (
-                                    <div className="text-gray-500 text-center text-sm">
-                                        <div className="text-4xl mb-2">📺</div>
-                                        Waiting for stream...
-                                    </div>
-                                )}
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            );
-        };
+          conn.on('data', (data) => {
+            if (!data || typeof data !== 'object') return;
 
-        // --- TESTER (ИГРОК) ---
-        const TesterView = ({ hostId }) => {
-            const [msg, setMsg] = useState('Connecting...');
-            const [isReady, setIsReady] = useState(false);
-            const [isSharing, setIsSharing] = useState(false);
-            const [downloadProgress, setDownloadProgress] = useState(0);
-
-            const peerRef = useRef(null);
-            const iframeRef = useRef(null);
-            const callRef = useRef(null);
-
-            useEffect(() => {
-                const peer = createPeer();
-                peerRef.current = peer;
-
-                peer.on('open', () => {
-                    const conn = peer.connect(hostId);
-
-                    conn.on('open', () => {
-                        setMsg('Connected! Waiting for data...');
-                    });
-
-                    conn.on('data', async (data) => {
-                        if (data && data.type === 'meta') {
-                            // Просто текст Downloading game...
-                            setDownloadProgress(0);
-                            setMsg('Downloading game...');
-                        } else {
-                            // данные получены полностью, всё ещё показываем Downloading game...
-                            setDownloadProgress(100);
-                            setMsg('Downloading game...');
-                            await processZip(data);
-                        }
-                    });
-
-                    conn.on('close', () => {
-                        setMsg('Host disconnected');
-                    });
-                });
-
-                return () => {
-                    try { peer.destroy(); } catch (e) {}
-                    peerRef.current = null;
-                };
-            }, [hostId]);
-
-            const processZip = async (data) => {
-                try {
-                    const zip = await JSZip.loadAsync(data);
-                    const files = [];
-                    let hasIndex = false;
-
-                    const promises = Object.keys(zip.files).map(async (path) => {
-                        const entry = zip.files[path];
-                        if (entry.dir) return;
-
-                        let blob = await entry.async('blob');
-
-                        // Патчим index.html (WebGL / SW)
-                        if (path.toLowerCase().endsWith('index.html')) {
-                            let text = await blob.text();
-
-                            const patch = `
-                            <script>
-                              (function() {
-                                console.log("⚠️ WEBGL PATCHER STARTED ⚠️");
-                                if (navigator.serviceWorker) {
-                                  navigator.serviceWorker.register = function() {
-                                    return new Promise(function() {});
-                                  };
-                                }
-                                const oldGetContext = HTMLCanvasElement.prototype.getContext;
-                                HTMLCanvasElement.prototype.getContext = function(type, options) {
-                                  options = options || {};
-                                  if (type === 'webgl' || type === 'webgl2') {
-                                    options.preserveDrawingBuffer = true;
-                                    options.alpha = false;
-                                    options.stencil = true;
-                                  }
-                                  return oldGetContext.call(this, type, options);
-                                };
-                              })();
-                            <\/script>`;
-
-                            if (text.includes('<head>')) {
-                                text = text.replace('<head>', '<head>' + patch);
-                            } else {
-                                text = patch + text;
-                            }
-
-                            blob = new Blob([text], { type: 'text/html' });
-                            hasIndex = true;
-                        }
-
-                        files.push({ path, blob });
-                    });
-
-                    await Promise.all(promises);
-
-                    if (!hasIndex) {
-                        setMsg('Error: No index.html');
-                        return;
-                    }
-
-                    if (!('serviceWorker' in navigator)) {
-                        setMsg('Service Worker not supported');
-                        return;
-                    }
-
-                    // 🔧 ИСПРАВЛЕНО: убран scope: '/'
-                    const reg = await navigator.serviceWorker.register('./worker.js');
-                    await reg.update();
-
-                    const waitForController = () => {
-                        if (navigator.serviceWorker.controller) return Promise.resolve();
-                        return new Promise(resolve => {
-                            navigator.serviceWorker.addEventListener('controllerchange', () => resolve(), { once: true });
-                        });
-                    };
-
-                    setMsg('Activating Environment...');
-                    await waitForController();
-
-                    const onMessage = (e) => {
-                        if (e.data && e.data.type === 'CACHE_COMPLETE') {
-                            setIsReady(true);
-                            setMsg('');
-                            navigator.serviceWorker.removeEventListener('message', onMessage);
-                        }
-                    };
-
-                    navigator.serviceWorker.addEventListener('message', onMessage);
-
-                    navigator.serviceWorker.controller.postMessage({
-                        type: 'CACHE_FILES',
-                        files,
-                    });
-                } catch (e) {
-                    console.error(e);
-                    setMsg('Error processing file.');
-                }
-            };
-
-            // Стримим через getDisplayMedia (экран/вкладка) — максимум качества и есть звук
-            const startScreenShare = async () => {
-                if (!peerRef.current) return;
-                if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
-                    alert('Screen Share API not supported in this browser.');
-                    return;
-                }
-
-                try {
-                    setIsSharing(true);
-
-                    const stream = await navigator.mediaDevices.getDisplayMedia({
-                        video: { frameRate: 60 },
-                        audio: true,
-                    });
-
-                    const videoTrack = stream.getVideoTracks()[0];
-                    if (videoTrack) {
-                        videoTrack.addEventListener('ended', () => {
-                            setIsSharing(false);
-                            callRef.current && callRef.current.close();
-                        });
-                    }
-
-                    const call = peerRef.current.call(hostId, stream);
-                    callRef.current = call;
-                } catch (err) {
-                    console.error('getDisplayMedia error', err);
-                    setIsSharing(false);
-                    if (!err || err.name !== 'AbortError') {
-                        alert('Failed to start screen sharing.');
-                    }
-                }
-            };
-
-            // Авто-запрос на шаринг, когда игра готова (без кнопки)
-            useEffect(() => {
-                if (isReady) {
-                    startScreenShare();
-                }
-            }, [isReady]);
-
-            if (isReady) {
-                return (
-                    <div className="w-screen h-screen bg-black relative">
-                        <iframe
-                            ref={iframeRef}
-                            src="game/index.html"
-                            className="w-full h-full border-0 block"
-                            allow="autoplay; fullscreen; gamepad; accelerometer; gyroscope"
-                        />
-                    </div>
+            if (data.type === 'log_batch' && Array.isArray(data.entries)) {
+              setLogs(prev => {
+                const next = prev.concat(
+                  data.entries.map((e) => ({
+                    id: e.id || (crypto?.randomUUID?.() || String(Math.random())),
+                    level: e.level || 'log',
+                    ts: e.ts || Date.now(),
+                    t: e.t || 0,
+                    text: e.text || '',
+                  }))
                 );
+                return next.length > 2000 ? next.slice(next.length - 2000) : next;
+              });
+              return;
             }
 
-            return (
-                <div className="min-h-screen bg-black flex flex-col items-center justify-center text-center p-4 text-white">
-                    <div className="text-4xl mb-4 animate-bounce">🎮</div>
-                    <h1 className="text-2xl font-bold mb-2">{msg}</h1>
-                    <p className="text-gray-500 text-sm">Do not close this tab</p>
+            if (data.type === 'input' && data.payload) {
+              const p = data.payload;
+              if (p.kind === 'cursor') {
+                setCursor({
+                  visible: !!p.visible,
+                  x: clamp01(p.x ?? 0.5),
+                  y: clamp01(p.y ?? 0.5),
+                  device: p.device || 'mouse',
+                });
+                return;
+              }
+              if (p.kind === 'click') {
+                const id = (crypto?.randomUUID?.() || String(Math.random()));
+                setClickPulse({ x: clamp01(p.x ?? 0.5), y: clamp01(p.y ?? 0.5), id });
+                setTimeout(() => {
+                  setClickPulse(cp => (cp && cp.id === id ? null : cp));
+                }, 450);
+                return;
+              }
+            }
+          });
+
+          const file = zipFileRef.current;
+          if (file) await sendFile(conn, file);
+          else setStatusMsg('Tester connected. Upload ZIP.');
+        });
+
+        conn.on('close', () => {
+          setStatusMsg('Tester disconnected.');
+          setRemoteStream(null);
+          setCursor({ visible: false, x: 0.5, y: 0.5, device: 'mouse' });
+        });
+      });
+
+      peer.on('call', (call) => {
+        call.answer(null);
+        call.on('stream', (stream) => {
+          setRemoteStream(stream);
+          setStatusMsg('Receiving stream...');
+        });
+      });
+
+      return () => {
+        try { peer.destroy(); } catch (e) {}
+        peerRef.current = null;
+        connRef.current = null;
+      };
+    }, []);
+
+    useEffect(() => {
+      if (videoRef.current && remoteStream) {
+        videoRef.current.srcObject = remoteStream;
+      }
+    }, [remoteStream]);
+
+    useEffect(() => {
+      const v = videoRef.current;
+      if (!v) return;
+      const onMeta = () => setVideoMeta({ vw: v.videoWidth || 0, vh: v.videoHeight || 0 });
+      v.addEventListener('loadedmetadata', onMeta);
+      v.addEventListener('resize', onMeta);
+      return () => {
+        v.removeEventListener('loadedmetadata', onMeta);
+        v.removeEventListener('resize', onMeta);
+      };
+    }, []);
+
+    useEffect(() => {
+      const el = videoWrapRef.current;
+      if (!el) return;
+
+      const ro = new ResizeObserver(() => {
+        const rect = el.getBoundingClientRect();
+        setWrapSize({ w: rect.width, h: rect.height });
+      });
+      ro.observe(el);
+      const rect = el.getBoundingClientRect();
+      setWrapSize({ w: rect.width, h: rect.height });
+      return () => ro.disconnect();
+    }, []);
+
+    const contentRect = useMemo(() => {
+      return computeContainedRect(wrapSize.w, wrapSize.h, videoMeta.vw, videoMeta.vh);
+    }, [wrapSize, videoMeta]);
+
+    const cursorStyle = useMemo(() => {
+      const px = contentRect.x + cursor.x * contentRect.w;
+      const py = contentRect.y + cursor.y * contentRect.h;
+      return { transform: `translate(${px}px, ${py}px) translate(-50%, -50%)` };
+    }, [cursor, contentRect]);
+
+    const pulseStyle = useMemo(() => {
+      if (!clickPulse) return null;
+      const px = contentRect.x + clickPulse.x * contentRect.w;
+      const py = contentRect.y + clickPulse.y * contentRect.h;
+      return { transform: `translate(${px}px, ${py}px) translate(-50%, -50%)` };
+    }, [clickPulse, contentRect]);
+
+    const handleFile = async (e) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+
+      setIsValidating(true);
+      try {
+        const zip = await JSZip.loadAsync(file);
+        const hasIndex = Object.keys(zip.files).some(p => p.toLowerCase().endsWith('index.html'));
+        if (!hasIndex) {
+          alert('No index.html found!');
+          setIsValidating(false);
+          return;
+        }
+
+        setZipFile(file);
+        zipFileRef.current = file;
+        setStatusMsg('Verified! Share link.');
+
+        if (connRef.current && connRef.current.open) {
+          await sendFile(connRef.current, file);
+        }
+      } catch (err) {
+        console.error(err);
+        alert('Invalid ZIP');
+      }
+      setIsValidating(false);
+    };
+
+    const sendFile = async (conn, file) => {
+      if (!conn || !conn.open || !file) return;
+
+      setStatusMsg(`Sending ${file.name}...`);
+
+      const buffer = await file.arrayBuffer();
+      const u8 = new Uint8Array(buffer);
+      const totalChunks = Math.ceil(u8.byteLength / CHUNK_SIZE);
+
+      conn.send({
+        type: 'meta',
+        filename: file.name,
+        size: u8.byteLength,
+        chunkSize: CHUNK_SIZE,
+        totalChunks
+      });
+
+      await sleep(150);
+
+      for (let i = 0; i < totalChunks; i++) {
+        const start = i * CHUNK_SIZE;
+        const end = Math.min(u8.byteLength, start + CHUNK_SIZE);
+        const payload = u8.slice(start, end);
+        const packetU8 = makeChunkPacket(i, totalChunks, payload);
+
+        await waitDrain(conn);
+        conn.send(packetU8);
+
+        if (i % 32 === 0) await sleep(0);
+      }
+
+      await sleep(50);
+      conn.send({ type: 'done' });
+      setStatusMsg('Sent. Waiting for stream...');
+    };
+
+    const link = peerId
+      ? `${window.location.origin}${window.location.pathname}#/play?host=${peerId}`
+      : '...';
+
+    useEffect(() => {
+      const el = consoleRef.current;
+      if (!el) return;
+      if (shouldAutoScrollRef.current) el.scrollTop = el.scrollHeight;
+    }, [logs.length]);
+
+    const onConsoleScroll = () => {
+      const el = consoleRef.current;
+      if (!el) return;
+      const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
+      shouldAutoScrollRef.current = dist < 60;
+    };
+
+    const clearLogs = () => setLogs([]);
+
+    return (
+      <div className="w-screen h-screen p-0 m-0">
+        <div className="w-full h-full flex gap-0">
+          {/* LEFT */}
+          <div className="flex-1 h-full flex flex-col min-w-0">
+            {/* top bar */}
+            <div className="bg-gray-800 p-3 border-b border-gray-700 flex items-center gap-4">
+              <label className="flex-1 max-w-xs block px-3 py-2 border-2 border-dashed border-gray-600 rounded-lg text-center cursor-pointer hover:border-blue-500">
+                <input type="file" onChange={handleFile} className="hidden" accept=".zip" />
+                <div className="text-2xl mb-1">
+                  {zipFile ? '✅' : (isValidating ? '⏳' : '📂')}
                 </div>
-            );
+                <span className="text-xs truncate block">
+                  {zipFile ? zipFile.name : "Select Game ZIP"}
+                </span>
+              </label>
+
+              <div className="flex-1 flex flex-col gap-1 min-w-0">
+                <div className="flex gap-2">
+                  <input
+                    readOnly
+                    value={zipFile ? link : '...'}
+                    className="bg-black/50 border border-gray-600 rounded px-2 py-1 w-full text-xs"
+                  />
+                  <button
+                    onClick={() => zipFile && navigator.clipboard.writeText(link)}
+                    className="bg-blue-600 px-3 py-1 rounded text-sm"
+                  >
+                    📋
+                  </button>
+                </div>
+                <div className="text-xs text-gray-400">{statusMsg}</div>
+              </div>
+            </div>
+
+            {/* video fills remaining space */}
+            <div className="flex-1 p-3">
+              <div
+                ref={videoWrapRef}
+                className="w-full h-full bg-black rounded-xl border border-gray-700 overflow-hidden relative"
+              >
+                {remoteStream ? (
+                  <>
+                    <video
+                      ref={videoRef}
+                      className="w-full h-full object-contain"
+                      autoPlay
+                      playsInline
+                      style={{ imageRendering: 'crisp-edges' }}
+                    />
+                    {cursor.visible && (
+                      <div
+                        className="absolute w-4 h-4 rounded-full border border-white/80 bg-white/20 pointer-events-none"
+                        style={cursorStyle}
+                      />
+                    )}
+                    {clickPulse && pulseStyle && (
+                      <div
+                        className="absolute w-14 h-14 rounded-full border-2 border-white/60 pointer-events-none animate-ping"
+                        style={pulseStyle}
+                      />
+                    )}
+                  </>
+                ) : (
+                  <div className="w-full h-full flex items-center justify-center text-gray-500 text-center text-sm">
+                    <div>
+                      <div className="text-4xl mb-2">📺</div>
+                      Waiting for stream...
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* RIGHT console */}
+          <div className="w-[420px] max-w-[45vw] min-w-[320px] h-full flex flex-col bg-gray-800 border-l border-gray-700">
+            <div className="flex items-center justify-between px-3 py-2 border-b border-gray-700">
+              <div className="text-sm font-semibold text-gray-200">Console</div>
+              <button
+                onClick={clearLogs}
+                className="text-xs bg-gray-900/60 hover:bg-gray-900 border border-gray-700 rounded px-2 py-1"
+              >
+                Clear
+              </button>
+            </div>
+
+            <div
+              ref={consoleRef}
+              onScroll={onConsoleScroll}
+              className="flex-1 overflow-auto p-2 text-xs leading-4"
+            >
+              {logs.length === 0 ? (
+                <div className="text-gray-400 p-2">No logs yet.</div>
+              ) : (
+                logs.map((l, idx) => {
+                  const bg = idx % 2 === 0 ? 'bg-black/25' : 'bg-black/10';
+                  const levelColor =
+                    l.level === 'error' ? 'text-red-300' :
+                    l.level === 'warn' ? 'text-yellow-300' :
+                    l.level === 'info' ? 'text-blue-300' :
+                    'text-gray-200';
+
+                  const full = String(l.text || '');
+                  const isLong = full.length > 140 || full.includes('\n');
+                  const summary = isLong ? (full.slice(0, 140) + '…') : full;
+
+                  const time = new Date(l.ts || Date.now()).toLocaleTimeString();
+
+                  return (
+                    <div key={l.id} className={`rounded mb-1 ${bg} border border-white/5`}>
+                      <details className="group">
+                        <summary className="cursor-pointer select-none px-2 py-1 flex gap-2 items-start">
+                          <span className="text-gray-400 shrink-0">{time}</span>
+                          <span className={`shrink-0 uppercase ${levelColor}`}>{l.level}</span>
+                          <span className="text-gray-100 break-words">
+                            {summary || <span className="text-gray-500">(empty)</span>}
+                          </span>
+                        </summary>
+                        <div className="px-2 pb-2 text-gray-200">
+                          <pre className="whitespace-pre-wrap break-words">{full}</pre>
+                        </div>
+                      </details>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+
+            <div className="px-3 py-2 border-t border-gray-700 text-[11px] text-gray-400">
+              Logs are forwarded from tester (batched every 200ms).
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // =========================
+  // TESTER (ИГРОК)
+  // =========================
+  const TesterView = ({ hostId }) => {
+    const [msg, setMsg] = useState('Connecting...');
+    const [isReady, setIsReady] = useState(false);
+
+    const peerRef = useRef(null);
+    const iframeRef = useRef(null);
+    const callRef = useRef(null);
+    const connRef = useRef(null);
+
+    const recvMetaRef = useRef(null);
+    const recvChunksRef = useRef(null);
+    const recvCountRef = useRef(0);
+
+    const logQueueRef = useRef([]);
+    const logSeqRef = useRef(0);
+    const flushTimerRef = useRef(null);
+
+    const lastCursorSendRef = useRef(0);
+
+    useEffect(() => {
+      const peer = createPeer();
+      peerRef.current = peer;
+
+      peer.on('open', () => {
+        const conn = peer.connect(hostId);
+        connRef.current = conn;
+        try { conn.binaryType = 'arraybuffer'; } catch (e) {}
+
+        conn.on('open', () => {
+          try { conn.binaryType = 'arraybuffer'; } catch (e) {}
+          setMsg('Connected! Waiting for data...');
+        });
+
+        conn.on('data', async (data) => {
+          if (data && typeof data === 'object' && data.type === 'meta') {
+            recvMetaRef.current = data;
+            recvChunksRef.current = new Array(data.totalChunks);
+            recvCountRef.current = 0;
+            setMsg('Downloading game...');
+            return;
+          }
+
+          if (data && typeof data === 'object' && data.type === 'done') {
+            await tryAssembleAndProcess();
+            return;
+          }
+
+          const ab = await toArrayBuffer(data);
+          if (!ab) return;
+
+          const parsed = parseChunkPacket(ab);
+          if (!parsed) return;
+
+          const meta = recvMetaRef.current;
+          if (!meta || meta.totalChunks !== parsed.totalChunks) return;
+
+          const chunks = recvChunksRef.current;
+          if (!chunks) return;
+
+          const { chunkIndex, payload } = parsed;
+          if (chunkIndex < 0 || chunkIndex >= meta.totalChunks) return;
+
+          if (!chunks[chunkIndex]) {
+            chunks[chunkIndex] = payload;
+            recvCountRef.current += 1;
+          }
+        });
+
+        conn.on('close', () => setMsg('Host disconnected'));
+      });
+
+      return () => {
+        try { peer.destroy(); } catch (e) {}
+        peerRef.current = null;
+        connRef.current = null;
+      };
+    }, [hostId]);
+
+    const enqueueLog = (entry) => {
+      logQueueRef.current.push(entry);
+      if (!flushTimerRef.current) {
+        flushTimerRef.current = setInterval(() => flushLogs(), 200);
+      }
+    };
+
+    const flushLogs = () => {
+      const conn = connRef.current;
+      if (!conn || !conn.open) return;
+
+      const q = logQueueRef.current;
+      if (!q.length) return;
+
+      const batch = q.splice(0, 200);
+      conn.send({ type: 'log_batch', entries: batch });
+
+      if (!logQueueRef.current.length) {
+        clearInterval(flushTimerRef.current);
+        flushTimerRef.current = null;
+      }
+    };
+
+    const sendInput = (payload) => {
+      const conn = connRef.current;
+      if (!conn || !conn.open) return;
+      conn.send({ type: 'input', payload });
+    };
+
+    const tryAssembleAndProcess = async () => {
+      const meta = recvMetaRef.current;
+      const chunks = recvChunksRef.current;
+      if (!meta || !chunks) {
+        setMsg('Error: missing data');
+        return;
+      }
+
+      for (let attempt = 0; attempt < 10; attempt++) {
+        if (recvCountRef.current === meta.totalChunks) break;
+        await sleep(120);
+      }
+
+      if (recvCountRef.current !== meta.totalChunks) {
+        setMsg('Error: missing chunk(s)');
+        return;
+      }
+
+      const parts = [];
+      for (let i = 0; i < meta.totalChunks; i++) {
+        if (!chunks[i]) {
+          setMsg('Error: missing chunk(s)');
+          return;
+        }
+        parts.push(new Uint8Array(chunks[i]));
+      }
+
+      const size = parts.reduce((s, b) => s + b.byteLength, 0);
+      const out = new Uint8Array(size);
+      let offset = 0;
+      for (const b of parts) {
+        out.set(b, offset);
+        offset += b.byteLength;
+      }
+
+      await processZip(out.buffer);
+    };
+
+    const processZip = async (zipArrayBuffer) => {
+      try {
+        const zip = await JSZip.loadAsync(zipArrayBuffer);
+        const files = [];
+        let hasIndex = false;
+
+        const patchIntoIndex = async (blob) => {
+          let text = await blob.text();
+
+          // Adds:
+          // - safe SW block
+          // - WebGL patch
+          // - console forwarder
+          // - AUTO FULLSCREEN on mobile: re-enter on every tap if not fullscreen
+          const patch = `
+<script>
+(function() {
+  // Safe internal SW register block
+  try {
+    if (navigator.serviceWorker && navigator.serviceWorker.register) {
+      const orig = navigator.serviceWorker.register.bind(navigator.serviceWorker);
+      navigator.serviceWorker.register = function(scriptURL, options) {
+        try {
+          const u = String(scriptURL || '');
+          if (u.includes('sw.js') || u.includes('service-worker') || u.includes('offline')) {
+            return Promise.resolve({ scope: (options && options.scope) || '' });
+          }
+        } catch(e) {}
+        return orig(scriptURL, options);
+      };
+    }
+  } catch(e) {}
+
+  // WebGL tweaks
+  try {
+    const oldGetContext = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = function(type, options) {
+      options = options || {};
+      if (type === 'webgl' || type === 'webgl2') {
+        options.preserveDrawingBuffer = true;
+        options.alpha = false;
+        options.stencil = true;
+      }
+      return oldGetContext.call(this, type, options);
+    };
+  } catch(e) {}
+
+  // Console forwarder
+  try {
+    const send = function(level, args) {
+      try {
+        const payload = {
+          __p2p_log__: true,
+          level: level,
+          ts: Date.now(),
+          t: (performance && performance.now) ? performance.now() : 0,
+          args: args
+        };
+        window.parent && window.parent.postMessage(payload, '*');
+      } catch(e) {}
+    };
+
+    const wrap = function(level, orig) {
+      return function() {
+        try {
+          const arr = Array.prototype.slice.call(arguments).map(function(v) {
+            try {
+              if (v instanceof Error) return (v.name + ': ' + v.message + '\\n' + (v.stack || ''));
+              if (typeof v === 'string') return v;
+              return JSON.stringify(v);
+            } catch(e) {
+              try { return String(v); } catch(e2) { return '[unserializable]'; }
+            }
+          });
+          send(level, arr);
+        } catch(e) {}
+        return orig && orig.apply(console, arguments);
+      };
+    };
+
+    console.log = wrap('log', console.log);
+    console.info = wrap('info', console.info);
+    console.warn = wrap('warn', console.warn);
+    console.error = wrap('error', console.error);
+
+    window.addEventListener('error', function(ev) {
+      try {
+        send('error', [String(ev.message || 'Error'), String(ev.filename || ''), String(ev.lineno || ''), String(ev.colno || ''), ev.error ? (ev.error.stack || String(ev.error)) : '' ]);
+      } catch(e) {}
+    });
+
+    window.addEventListener('unhandledrejection', function(ev) {
+      try {
+        const r = ev && ev.reason;
+        let msg = '';
+        try {
+          msg = (r && r.stack) ? r.stack : (typeof r === 'string' ? r : JSON.stringify(r));
+        } catch(e) { try { msg = String(r); } catch(e2) { msg = '[unserializable rejection]'; } }
+        send('error', ['UnhandledRejection', msg]);
+      } catch(e) {}
+    });
+  } catch(e) {}
+
+  // Auto fullscreen on every tap if not fullscreen (mobile-friendly)
+  try {
+    const root = document.documentElement;
+
+    const reqFS = function() {
+      try {
+        const isFs = !!(document.fullscreenElement || document.webkitFullscreenElement);
+        if (isFs) return;
+        const fn = root.requestFullscreen || root.webkitRequestFullscreen;
+        if (fn) fn.call(root);
+      } catch(e) {}
+    };
+
+    // pointerdown/touchstart qualifies as user gesture
+    document.addEventListener('pointerdown', reqFS, { passive: true, capture: true });
+    document.addEventListener('touchstart', reqFS, { passive: true, capture: true });
+  } catch(e) {}
+})();
+<\/script>`;
+
+          if (text.includes('<head>')) text = text.replace('<head>', '<head>' + patch);
+          else text = patch + text;
+
+          return new Blob([text], { type: 'text/html' });
         };
 
-        const App = () => {
-            const [route, setRoute] = useState('host');
-            const [hostId, setHostId] = useState('');
+        const promises = Object.keys(zip.files).map(async (path) => {
+          const entry = zip.files[path];
+          if (entry.dir) return;
 
-            useEffect(() => {
-                const check = () => {
-                    const hash = window.location.hash;
-                    if (hash.includes('/play')) {
-                        const id = new URLSearchParams(hash.split('?')[1] || '').get('host');
-                        if (id) {
-                            setHostId(id);
-                            setRoute('play');
-                            return;
-                        }
-                    }
-                    setRoute('host');
-                };
-                check();
-                window.addEventListener('hashchange', check);
-                return () => window.removeEventListener('hashchange', check);
-            }, []);
+          let blob = await entry.async('blob');
 
-            return route === 'play' ? <TesterView hostId={hostId} /> : <HostView />;
+          if (path.toLowerCase().endsWith('index.html')) {
+            blob = await patchIntoIndex(blob);
+            hasIndex = true;
+          }
+
+          files.push({ path, blob });
+        });
+
+        await Promise.all(promises);
+
+        if (!hasIndex) { setMsg('Error: No index.html'); return; }
+        if (!('serviceWorker' in navigator)) { setMsg('Service Worker not supported'); return; }
+
+        const reg = await navigator.serviceWorker.register('./worker.js');
+        await reg.update();
+
+        const waitForController = () => {
+          if (navigator.serviceWorker.controller) return Promise.resolve();
+          return new Promise(resolve => {
+            navigator.serviceWorker.addEventListener('controllerchange', () => resolve(), { once: true });
+          });
         };
 
-        const root = ReactDOM.createRoot(document.getElementById('root'));
-        root.render(<App />);
-    </script>
+        setMsg('Activating Environment...');
+        await waitForController();
+
+        const onMessage = (e) => {
+          if (e.data && e.data.type === 'CACHE_COMPLETE') {
+            setIsReady(true);
+            setMsg('');
+            navigator.serviceWorker.removeEventListener('message', onMessage);
+          }
+        };
+        navigator.serviceWorker.addEventListener('message', onMessage);
+
+        navigator.serviceWorker.controller.postMessage({ type: 'CACHE_FILES', files });
+      } catch (e) {
+        console.error(e);
+        setMsg('Error processing file.');
+      }
+    };
+
+    const placeCallWithBitrate = async (stream) => {
+      try { const vt = stream.getVideoTracks?.()[0]; if (vt) vt.contentHint = 'detail'; } catch (e) {}
+      const call = peerRef.current.call(hostId, stream);
+      callRef.current = call;
+      setTimeout(() => setCallBitrate(call, { maxKbps: 8000, minKbps: 2000, maxFramerate: 60, scaleDown: 1.0 }), 250);
+    };
+
+    const startStreaming = async () => {
+      if (!peerRef.current) return;
+
+      // canvas.captureStream
+      try {
+        const iframe = iframeRef.current;
+        const doc = iframe?.contentDocument || iframe?.contentWindow?.document;
+        if (doc) {
+          const canvas = doc.querySelector('canvas');
+          if (canvas && canvas.captureStream) {
+            const stream = canvas.captureStream(60);
+            await placeCallWithBitrate(stream);
+            return;
+          }
+        }
+      } catch (e) {}
+
+      // display media fallback
+      if (navigator.mediaDevices?.getDisplayMedia) {
+        try {
+          const stream = await navigator.mediaDevices.getDisplayMedia({
+            video: { frameRate: 60, width: { ideal: 1920 }, height: { ideal: 1080 } },
+            audio: true
+          });
+          const vt = stream.getVideoTracks()[0];
+          if (vt) vt.addEventListener('ended', () => callRef.current && callRef.current.close());
+          await placeCallWithBitrate(stream);
+        } catch (e) {}
+      }
+    };
+
+    // Receive logs from iframe (postMessage)
+    useEffect(() => {
+      const onMsg = (ev) => {
+        const d = ev.data;
+        if (!d || !d.__p2p_log__) return;
+
+        const level = d.level || 'log';
+        const ts = d.ts || Date.now();
+        const t = d.t || 0;
+        const args = Array.isArray(d.args) ? d.args : [String(d.args ?? '')];
+        const text = args.join(' ');
+
+        const id = `${Date.now()}_${logSeqRef.current++}`;
+        enqueueLog({ id, level, ts, t, text });
+      };
+
+      window.addEventListener('message', onMsg);
+      return () => window.removeEventListener('message', onMsg);
+    }, []);
+
+    // ✅ FIX: listen INSIDE iframe (events do not bubble to <iframe> element)
+    const cleanupInputRef = useRef(null);
+
+    const attachInputListenersInsideIframe = () => {
+      const iframe = iframeRef.current;
+      const win = iframe?.contentWindow;
+      const doc = iframe?.contentDocument || win?.document;
+      if (!iframe || !win || !doc) return null;
+
+      const getNormFromClient = (clientX, clientY) => {
+        const rect = iframe.getBoundingClientRect();
+        const x = clamp01((clientX - rect.left) / rect.width);
+        const y = clamp01((clientY - rect.top) / rect.height);
+        return { x, y };
+      };
+
+      const sendCursor = (clientX, clientY) => {
+        const now = performance.now();
+        if (now - lastCursorSendRef.current < 16) return; // ~60fps
+        lastCursorSendRef.current = now;
+
+        const { x, y } = getNormFromClient(clientX, clientY);
+        sendInput({ kind: 'cursor', visible: true, x, y, device: 'mouse' });
+      };
+
+      const onPointerMove = (e) => {
+        if (e.pointerType === 'mouse' || e.pointerType === 'pen') {
+          sendCursor(e.clientX, e.clientY);
+        }
+      };
+
+      const onPointerDown = (e) => {
+        const { x, y } = getNormFromClient(e.clientX, e.clientY);
+        sendInput({ kind: 'click', x, y, device: e.pointerType || 'pointer', button: e.button });
+      };
+
+      const onMouseLeaveWindow = () => {
+        sendInput({ kind: 'cursor', visible: false, x: 0.5, y: 0.5, device: 'mouse' });
+      };
+
+      const onTouchStart = (e) => {
+        const t = e.touches && e.touches[0];
+        if (!t) return;
+        const { x, y } = getNormFromClient(t.clientX, t.clientY);
+        sendInput({ kind: 'click', x, y, device: 'touch' });
+      };
+
+      // capture=true to catch even if game stops propagation
+      doc.addEventListener('pointermove', onPointerMove, { passive: true, capture: true });
+      doc.addEventListener('pointerdown', onPointerDown, { passive: true, capture: true });
+      doc.addEventListener('touchstart', onTouchStart, { passive: true, capture: true });
+
+      win.addEventListener('blur', onMouseLeaveWindow, { passive: true });
+      win.addEventListener('mouseout', onMouseLeaveWindow, { passive: true });
+
+      return () => {
+        doc.removeEventListener('pointermove', onPointerMove, true);
+        doc.removeEventListener('pointerdown', onPointerDown, true);
+        doc.removeEventListener('touchstart', onTouchStart, true);
+
+        win.removeEventListener('blur', onMouseLeaveWindow);
+        win.removeEventListener('mouseout', onMouseLeaveWindow);
+      };
+    };
+
+    const handleGameLoaded = () => {
+      // attach input listeners
+      if (cleanupInputRef.current) {
+        try { cleanupInputRef.current(); } catch {}
+        cleanupInputRef.current = null;
+      }
+      cleanupInputRef.current = attachInputListenersInsideIframe();
+
+      // start stream
+      setTimeout(() => startStreaming(), 400);
+    };
+
+    useEffect(() => {
+      return () => {
+        if (cleanupInputRef.current) {
+          try { cleanupInputRef.current(); } catch {}
+          cleanupInputRef.current = null;
+        }
+        if (flushTimerRef.current) {
+          clearInterval(flushTimerRef.current);
+          flushTimerRef.current = null;
+        }
+      };
+    }, []);
+
+    if (isReady) {
+      return (
+        <div className="w-screen h-screen bg-black relative">
+          <iframe
+            ref={iframeRef}
+            src="game/index.html"
+            className="w-full h-full border-0 block"
+            allow="autoplay; fullscreen; gamepad; accelerometer; gyroscope"
+            onLoad={handleGameLoaded}
+          />
+        </div>
+      );
+    }
+
+    return (
+      <div className="min-h-screen bg-black flex flex-col items-center justify-center text-center p-4 text-white">
+        <div className="text-4xl mb-4 animate-bounce">🎮</div>
+        <h1 className="text-2xl font-bold mb-2">{msg}</h1>
+        <p className="text-gray-500 text-sm">Do not close this tab</p>
+      </div>
+    );
+  };
+
+  // =========================
+  // Router
+  // =========================
+  const App = () => {
+    const [route, setRoute] = useState('host');
+    const [hostId, setHostId] = useState('');
+
+    useEffect(() => {
+      const check = () => {
+        const hash = window.location.hash;
+        if (hash.includes('/play')) {
+          const id = new URLSearchParams(hash.split('?')[1] || '').get('host');
+          if (id) {
+            setHostId(id);
+            setRoute('play');
+            return;
+          }
+        }
+        setRoute('host');
+      };
+      check();
+      window.addEventListener('hashchange', check);
+      return () => window.removeEventListener('hashchange', check);
+    }, []);
+
+    return route === 'play' ? <TesterView hostId={hostId} /> : <HostView />;
+  };
+
+  const root = ReactDOM.createRoot(document.getElementById('root'));
+  root.render(<App />);
+</script>
 </body>
 </html>
