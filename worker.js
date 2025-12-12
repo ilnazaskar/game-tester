@@ -72,13 +72,12 @@ const findBlob = (requestedPath) => {
 
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
-
   if (!url.pathname.startsWith(GAME_PREFIX)) return;
 
   const rawPath = url.pathname.slice(GAME_PREFIX.length);
   const requestedPath = decodeURIComponent(rawPath || '');
 
-  // block game's internal sw/offline files
+  // block game's internal SW/offline files
   if (
     requestedPath.includes('sw.js') ||
     requestedPath.includes('service-worker') ||
