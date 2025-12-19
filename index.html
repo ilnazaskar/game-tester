@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -11,6 +12,16 @@
   <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<style>
+  @keyframes p2pTapPulse {
+    0%   { transform: scale(0.20); opacity: 0.95; }
+    60%  { transform: scale(1.00); opacity: 0.35; }
+    100% { transform: scale(1.28); opacity: 0.00; }
+  }
+  .p2p-tap-pulse { animation: p2pTapPulse 450ms ease-out forwards; }
+</style>
+
 </head>
 
 <body class="bg-gray-900 text-white overflow-hidden">
@@ -19,7 +30,29 @@
 <script type="text/babel">
   const { useState, useEffect, useRef, useMemo } = React;
 
-  const createPeer = (id) => new Peer(id, { debug: 1 });
+  const ICE_SERVERS = [
+    // Public STUN servers (no TURN)
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:global.stun.twilio.com:3478' }
+  ];
+
+  const PEER_OPTS = {
+    debug: 1,
+    // PeerJS Cloud (WSS/HTTPS) — avoids ws:// quirks on iOS/in-app browsers
+    host: '0.peerjs.com',
+    port: 443,
+    path: '/',
+    secure: true,
+    config: {
+      iceServers: ICE_SERVERS,
+      iceCandidatePoolSize: 4
+    }
+  };
+
+  const createPeer = (id) => (id ? new Peer(id, PEER_OPTS) : new Peer(PEER_OPTS));
+
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   const clamp01 = (v) => Math.max(0, Math.min(1, v));
 
@@ -150,6 +183,17 @@
       const peer = createPeer(id);
       peerRef.current = peer;
 
+      peer.on('error', (err) => {
+        console.warn('[PeerJS] host error', err);
+        const msg = (err && (err.type || err.name)) ? (err.type || err.name) : 'unknown';
+        const details = err && err.message ? `: ${err.message}` : '';
+        setStatusMsg(`Peer error (${msg})${details}`);
+      });
+
+      peer.on('disconnected', () => {
+        try { peer.reconnect(); } catch (e) {}
+      });
+
       peer.on('open', (id) => {
         setPeerId(id);
         setStatusMsg('Ready. Select ZIP.');
@@ -157,6 +201,13 @@
 
       peer.on('connection', (conn) => {
         connRef.current = conn;
+
+        const connectWatchdog = setTimeout(() => {
+          if (!conn.open) {
+            setStatusMsg('Still connecting... Tip: on iPhone open in Safari and try Wi‑Fi. Without TURN some networks cannot do P2P.');
+          }
+        }, 8000);
+
         try { conn.binaryType = 'arraybuffer'; } catch (e) {}
 
         setStatusMsg('Tester connected!');
@@ -221,7 +272,15 @@
 
       peer.on('call', (call) => {
         call.answer(null);
+        call.on('error', (err) => console.warn('[PeerJS] media error', err));
+        call.on('close', () => setRemoteStream(null));
         call.on('stream', (stream) => {
+          // Grab dimensions early (helps correct letterboxing before <video> metadata updates)
+          try {
+            const vt = stream?.getVideoTracks?.()[0];
+            const s = vt?.getSettings?.() || {};
+            if (s.width && s.height) setVideoMeta({ vw: s.width, vh: s.height });
+          } catch (e) {}
           setRemoteStream(stream);
           setStatusMsg('Receiving stream...');
         });
@@ -280,7 +339,8 @@
       if (!clickPulse) return null;
       const px = contentRect.x + clickPulse.x * contentRect.w;
       const py = contentRect.y + clickPulse.y * contentRect.h;
-      return { transform: `translate(${px}px, ${py}px) translate(-50%, -50%)` };
+      // NOTE: animation must NOT override positioning transform
+      return { left: px, top: py, transform: 'translate(-50%, -50%)' };
     }, [clickPulse, contentRect]);
 
     const handleFile = async (e) => {
@@ -411,10 +471,16 @@
                   <>
                     <video
                       ref={videoRef}
-                      className="w-full h-full object-contain"
+                      className="absolute"
                       autoPlay
                       playsInline
-                      style={{ imageRendering: 'crisp-edges' }}
+                      style={{
+                        left: contentRect.x,
+                        top: contentRect.y,
+                        width: contentRect.w,
+                        height: contentRect.h,
+                        objectFit: 'contain'
+                      }}
                     />
 
                     {/* cursor */}
@@ -427,10 +493,9 @@
 
                     {/* click pulse */}
                     {clickPulse && pulseStyle && (
-                      <div
-                        className="absolute w-14 h-14 rounded-full border-2 border-white/60 pointer-events-none animate-ping"
-                        style={pulseStyle}
-                      />
+                      <div className="absolute pointer-events-none" style={pulseStyle}>
+                        <div className="w-14 h-14 rounded-full border-2 border-white/70 p2p-tap-pulse" />
+                      </div>
                     )}
                   </>
                 ) : (
@@ -533,15 +598,44 @@
     const lastCursorSendRef = useRef(0);
 
     useEffect(() => {
+      if (!window.RTCPeerConnection) {
+        setMsg('WebRTC is not supported in this browser. Please open the link in Safari.');
+        return;
+      }
       const peer = createPeer();
       peerRef.current = peer;
 
+      // iOS / in-app browsers: surface failures instead of staying on "Connecting..."
+      const peerOpenWatchdog = setTimeout(() => {
+        setMsg('Connecting... If you are on iPhone: open this link in Safari (not in-app browser). Try Wi‑Fi (some networks block P2P without TURN).');
+      }, 7000);
+
+      peer.on('error', (err) => {
+        console.warn('[PeerJS] tester error', err);
+        const msg = (err && (err.type || err.name)) ? (err.type || err.name) : 'unknown';
+        const details = err && err.message ? `: ${err.message}` : '';
+        setMsg(`Connection error (${msg})${details}`);
+      });
+
+      peer.on('disconnected', () => {
+        try { peer.reconnect(); } catch (e) {}
+      });
+
       peer.on('open', () => {
-        const conn = peer.connect(hostId);
+        clearTimeout(peerOpenWatchdog);
+
+        const conn = peer.connect(hostId, { reliable: true, serialization: 'binary' });
         connRef.current = conn;
         try { conn.binaryType = 'arraybuffer'; } catch (e) {}
 
+        const connectWatchdog = setTimeout(() => {
+          if (!conn.open) {
+            setMsg('Connecting... If you are on iPhone: open this link in Safari (not in-app browser). Try Wi‑Fi (some networks block P2P without TURN).');
+          }
+        }, 8000);
+
         conn.on('open', () => {
+          clearTimeout(connectWatchdog);
           try { conn.binaryType = 'arraybuffer'; } catch (e) {}
           setMsg('Connected! Waiting for data...');
         });
@@ -581,10 +675,22 @@
           }
         });
 
-        conn.on('close', () => setMsg('Host disconnected'));
+        conn.on('error', (err) => {
+          clearTimeout(connectWatchdog);
+          console.warn('[PeerJS] data error', err);
+          const msg = (err && (err.type || err.name)) ? (err.type || err.name) : 'unknown';
+          const details = err && err.message ? `: ${err.message}` : '';
+          setMsg(`Connection error (${msg})${details}`);
+        });
+
+        conn.on('close', () => {
+          clearTimeout(connectWatchdog);
+          setMsg('Host disconnected');
+        });
       });
 
       return () => {
+        clearTimeout(peerOpenWatchdog);
         try { peer.destroy(); } catch (e) {}
         peerRef.current = null;
         connRef.current = null;
@@ -853,21 +959,24 @@
     const startStreaming = async () => {
       if (!peerRef.current) return;
 
-      // 1) Prefer canvas.captureStream everywhere
+      // 1) Prefer canvas.captureStream (no screen-share prompt).
+      //    Retry a bit: many games create the <canvas> shortly after iframe load.
       try {
-        const iframe = iframeRef.current;
-        const doc = iframe?.contentDocument || iframe?.contentWindow?.document;
-        if (doc) {
-          const canvas = doc.querySelector('canvas');
+        for (let i = 0; i < 40; i++) { // ~8s
+          const iframe = iframeRef.current;
+          const doc = iframe?.contentDocument || iframe?.contentWindow?.document;
+          const canvas = doc ? doc.querySelector('canvas') : null;
+
           if (canvas && canvas.captureStream) {
             const stream = canvas.captureStream(60);
             await placeCallWithBitrate(stream);
             return;
           }
+          await sleep(200);
         }
       } catch (e) {}
 
-      // 2) Fallback (desktop)
+      // 2) Fallback (desktop): ask user to share tab/screen
       if (navigator.mediaDevices?.getDisplayMedia) {
         try {
           const stream = await navigator.mediaDevices.getDisplayMedia({
@@ -879,8 +988,14 @@
           if (vt) vt.addEventListener('ended', () => callRef.current && callRef.current.close());
 
           await placeCallWithBitrate(stream);
-        } catch (e) {}
+          return;
+        } catch (e) {
+          console.warn('[Stream] getDisplayMedia failed', e);
+        }
       }
+
+      // 3) No supported capture method (common in iOS in-app browsers)
+      console.warn('[Stream] No capture method available (need canvas.captureStream or getDisplayMedia).');
     };
 
     // Receive logs from iframe via postMessage
@@ -915,21 +1030,31 @@
       const norm = (clientX, clientY) => {
         const w = win.innerWidth || 1;
         const h = win.innerHeight || 1;
-        return {
-          x: clamp01(clientX / w),
-          y: clamp01(clientY / h),
-        };
+        return { x: clamp01(clientX / w), y: clamp01(clientY / h) };
       };
 
       const sendCursor = (clientX, clientY, device = 'mouse') => {
         const now = performance.now();
         if (now - lastCursorSendRef.current < 16) return; // ~60fps
         lastCursorSendRef.current = now;
-
         const { x, y } = norm(clientX, clientY);
         sendInput({ kind: 'cursor', visible: true, x, y, device });
       };
 
+      // --- Tap detection for touch (pulse only on TAP, not on touch contact) ---
+      const TAP_MAX_MS = 350;
+      const TAP_MAX_MOVE = 12; // px
+      const tapRef = { active: false, x: 0, y: 0, t: 0 };
+
+      const onLeave = () => {
+        tapRef.active = false;
+        sendInput({ kind: 'cursor', visible: false, x: 0.5, y: 0.5, device: 'mouse' });
+      };
+
+      // Prefer Pointer Events if available (covers most modern browsers, incl. new iOS Safari)
+      const hasPointer = !!win.PointerEvent;
+
+      // Pointer handlers
       const onPointerMove = (e) => {
         if (e.pointerType === 'mouse' || e.pointerType === 'pen') {
           sendCursor(e.clientX, e.clientY, e.pointerType);
@@ -937,32 +1062,96 @@
       };
 
       const onPointerDown = (e) => {
+        if (e.pointerType === 'touch') {
+          tapRef.active = true;
+          tapRef.x = e.clientX;
+          tapRef.y = e.clientY;
+          tapRef.t = performance.now();
+          return; // DO NOT send click here (touch contact)
+        }
         const { x, y } = norm(e.clientX, e.clientY);
         sendInput({ kind: 'click', x, y, device: e.pointerType || 'pointer', button: e.button });
       };
 
+      const onPointerUp = (e) => {
+        if (e.pointerType !== 'touch') return;
+        if (!tapRef.active) return;
+        tapRef.active = false;
+
+        const dt = performance.now() - tapRef.t;
+        const dx = e.clientX - tapRef.x;
+        const dy = e.clientY - tapRef.y;
+
+        if (dt <= TAP_MAX_MS && (dx * dx + dy * dy) <= (TAP_MAX_MOVE * TAP_MAX_MOVE)) {
+          const { x, y } = norm(e.clientX, e.clientY);
+          sendInput({ kind: 'click', x, y, device: 'touch' });
+        }
+      };
+
+      const onPointerCancel = () => { tapRef.active = false; };
+
+      // Touch fallback (older browsers without PointerEvent)
       const onTouchStart = (e) => {
         const t = e.touches && e.touches[0];
         if (!t) return;
-        const { x, y } = norm(t.clientX, t.clientY);
-        sendInput({ kind: 'click', x, y, device: 'touch' });
+        tapRef.active = true;
+        tapRef.x = t.clientX;
+        tapRef.y = t.clientY;
+        tapRef.t = performance.now();
       };
 
-      const onLeave = () => {
-        sendInput({ kind: 'cursor', visible: false, x: 0.5, y: 0.5, device: 'mouse' });
+      const onTouchEnd = (e) => {
+        if (!tapRef.active) return;
+        tapRef.active = false;
+
+        const t = (e.changedTouches && e.changedTouches[0]) || null;
+        if (!t) return;
+
+        const dt = performance.now() - tapRef.t;
+        const dx = t.clientX - tapRef.x;
+        const dy = t.clientY - tapRef.y;
+
+        if (dt <= TAP_MAX_MS && (dx * dx + dy * dy) <= (TAP_MAX_MOVE * TAP_MAX_MOVE)) {
+          const { x, y } = norm(t.clientX, t.clientY);
+          sendInput({ kind: 'click', x, y, device: 'touch' });
+        }
+      };
+
+      const onMouseMove = (e) => sendCursor(e.clientX, e.clientY, 'mouse');
+      const onMouseDown = (e) => {
+        const { x, y } = norm(e.clientX, e.clientY);
+        sendInput({ kind: 'click', x, y, device: 'mouse', button: e.button });
       };
 
       // capture=true to catch even if game stops propagation
-      doc.addEventListener('pointermove', onPointerMove, { passive: true, capture: true });
-      doc.addEventListener('pointerdown', onPointerDown, { passive: true, capture: true });
-      doc.addEventListener('touchstart', onTouchStart, { passive: true, capture: true });
+      if (hasPointer) {
+        doc.addEventListener('pointermove', onPointerMove, { passive: true, capture: true });
+        doc.addEventListener('pointerdown', onPointerDown, { passive: true, capture: true });
+        doc.addEventListener('pointerup', onPointerUp, { passive: true, capture: true });
+        doc.addEventListener('pointercancel', onPointerCancel, { passive: true, capture: true });
+      } else {
+        doc.addEventListener('mousemove', onMouseMove, { passive: true, capture: true });
+        doc.addEventListener('mousedown', onMouseDown, { passive: true, capture: true });
+        doc.addEventListener('touchstart', onTouchStart, { passive: true, capture: true });
+        doc.addEventListener('touchend', onTouchEnd, { passive: true, capture: true });
+        doc.addEventListener('touchcancel', onLeave, { passive: true, capture: true });
+      }
 
       win.addEventListener('blur', onLeave, { passive: true });
 
       return () => {
-        doc.removeEventListener('pointermove', onPointerMove, true);
-        doc.removeEventListener('pointerdown', onPointerDown, true);
-        doc.removeEventListener('touchstart', onTouchStart, true);
+        if (hasPointer) {
+          doc.removeEventListener('pointermove', onPointerMove, true);
+          doc.removeEventListener('pointerdown', onPointerDown, true);
+          doc.removeEventListener('pointerup', onPointerUp, true);
+          doc.removeEventListener('pointercancel', onPointerCancel, true);
+        } else {
+          doc.removeEventListener('mousemove', onMouseMove, true);
+          doc.removeEventListener('mousedown', onMouseDown, true);
+          doc.removeEventListener('touchstart', onTouchStart, true);
+          doc.removeEventListener('touchend', onTouchEnd, true);
+          doc.removeEventListener('touchcancel', onLeave, true);
+        }
         win.removeEventListener('blur', onLeave);
       };
     };
