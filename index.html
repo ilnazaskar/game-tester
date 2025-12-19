@@ -735,23 +735,40 @@ const handleFile = async (e) => {
     });
   } catch(e) {}
 
-  // --- Soft fullscreen (keep current orientation; best-effort) ---
+  // --- Fullscreen (prefer fullscreening the iframe element to avoid orientation hacks in some engines) ---
   try {
     const getDesiredOrientation = () => {
       try {
-        return (window.innerHeight >= window.innerWidth) ? 'portrait' : 'landscape';
+        if (window.matchMedia && window.matchMedia('(orientation: portrait)').matches) return 'portrait';
+        return 'landscape';
       } catch (e) {
-        return 'portrait';
+        return (window.innerHeight >= window.innerWidth) ? 'portrait' : 'landscape';
       }
+    };
+
+    const isInFullscreen = () => {
+      try {
+        const topDoc = window.top && window.top.document;
+        if (topDoc && (topDoc.fullscreenElement || topDoc.webkitFullscreenElement)) return true;
+      } catch (e) {}
+      return !!(document.fullscreenElement || document.webkitFullscreenElement);
     };
 
     const requestSafeFullscreen = function() {
       try {
-        const isFs = !!(document.fullscreenElement || document.webkitFullscreenElement);
-        if (isFs) return;
+        if (isInFullscreen()) return;
 
-        const el = document.documentElement || document.body;
-        const fn = el.requestFullscreen || el.webkitRequestFullscreen;
+        // Prefer making the iframe element fullscreen (parent document), not the inner document.
+        let target = null;
+        try { target = window.frameElement; } catch (e) { target = null; }
+        if (!target) target = document.documentElement || document.body;
+
+        let fn = target && (target.requestFullscreen || target.webkitRequestFullscreen);
+        if (!fn && target !== (document.documentElement || document.body)) {
+          const fallback = document.documentElement || document.body;
+          fn = fallback && (fallback.requestFullscreen || fallback.webkitRequestFullscreen);
+          target = fallback;
+        }
         if (!fn) return;
 
         const desired = getDesiredOrientation();
@@ -759,11 +776,20 @@ const handleFile = async (e) => {
         const after = () => {
           try {
             const o = screen && screen.orientation;
-            if (o && o.lock) o.lock(desired).catch(() => {});
+            if (o && o.lock) {
+              const tryLock = (t) => { try { return o.lock(t).catch(() => {}); } catch(e) {} };
+              if (desired === 'portrait') {
+                tryLock('portrait-primary');
+                tryLock('portrait');
+              } else {
+                tryLock('landscape-primary');
+                tryLock('landscape');
+              }
+            }
           } catch (e) {}
         };
 
-        const res = fn.call(el);
+        const res = fn.call(target);
         if (res && typeof res.then === 'function') {
           res.then(after).catch(() => {});
         } else {
@@ -772,10 +798,11 @@ const handleFile = async (e) => {
       } catch (e) {}
     };
 
-    // Click is the most reliable "user gesture" trigger on mobile.
+    // User gesture triggers.
     document.addEventListener('click', requestSafeFullscreen, { capture: true });
     document.addEventListener('pointerdown', requestSafeFullscreen, { capture: true });
     document.addEventListener('touchend', requestSafeFullscreen, { capture: true });
+  } catch (e) {}
   } catch (e) {}
 })();
 <\/script>`;
