@@ -12,16 +12,6 @@
   <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-
-<style>
-  @keyframes p2pTapPulse {
-    0%   { transform: scale(0.20); opacity: 0.95; }
-    60%  { transform: scale(1.00); opacity: 0.35; }
-    100% { transform: scale(1.28); opacity: 0.00; }
-  }
-  .p2p-tap-pulse { animation: p2pTapPulse 450ms ease-out forwards; }
-</style>
-
 </head>
 
 <body class="bg-gray-900 text-white overflow-hidden">
@@ -164,8 +154,6 @@
 
     const [logs, setLogs] = useState([]);
     const [cursor, setCursor] = useState({ visible: false, x: 0.5, y: 0.5, device: 'mouse' });
-    const [clickPulse, setClickPulse] = useState(null);
-
     const peerRef = useRef(null);
     const connRef = useRef(null);
     const videoRef = useRef(null);
@@ -244,15 +232,6 @@
                   y: clamp01(p.y ?? 0.5),
                   device: p.device || 'mouse',
                 });
-                return;
-              }
-
-              if (p.kind === 'click') {
-                const id = (crypto?.randomUUID?.() || String(Math.random()));
-                setClickPulse({ x: clamp01(p.x ?? 0.5), y: clamp01(p.y ?? 0.5), id });
-                setTimeout(() => {
-                  setClickPulse(cp => (cp && cp.id === id ? null : cp));
-                }, 450);
                 return;
               }
             }
@@ -334,15 +313,6 @@
       const py = contentRect.y + cursor.y * contentRect.h;
       return { transform: `translate(${px}px, ${py}px) translate(-50%, -50%)` };
     }, [cursor, contentRect]);
-
-    const pulseStyle = useMemo(() => {
-      if (!clickPulse) return null;
-      const px = contentRect.x + clickPulse.x * contentRect.w;
-      const py = contentRect.y + clickPulse.y * contentRect.h;
-      // NOTE: animation must NOT override positioning transform
-      return { left: px, top: py, transform: 'translate(-50%, -50%)' };
-    }, [clickPulse, contentRect]);
-
     const handleFile = async (e) => {
       const file = e.target.files?.[0];
       if (!file) return;
@@ -490,15 +460,8 @@
                         style={cursorStyle}
                       />
                     )}
-
-                    {/* click pulse */}
-                    {clickPulse && pulseStyle && (
-                      <div className="absolute pointer-events-none" style={pulseStyle}>
-                        <div className="w-14 h-14 rounded-full border-2 border-white/70 p2p-tap-pulse" />
-                      </div>
-                    )}
                   </>
-                ) : (
+) : (
                   <div className="w-full h-full flex items-center justify-center text-gray-500 text-center text-sm">
                     <div>
                       <div className="text-4xl mb-2">📺</div>
@@ -777,7 +740,7 @@
           // - Safe internal SW register
           // - WebGL tweaks
           // - Console forwarder
-          // - Soft fullscreen (no forced orientation, uses body, re-enters on next tap)
+          // - Fullscreen redirect (fullscreen iframe element, keeps current orientation)
           const patch = `
 <script>
 (function() {
@@ -866,25 +829,70 @@
       } catch(e) {}
     });
   } catch(e) {}
-
-  // --- Soft fullscreen (NO forced orientation) ---
+  // --- Fullscreen redirect (keep current orientation, fullscreen the iframe element) ---
   try {
-    const requestSafeFullscreen = function() {
+    const requestFrameFullscreen = function() {
       try {
-        const isFs = !!(document.fullscreenElement || document.webkitFullscreenElement);
+        const pdoc = parent && parent.document;
+        const isFs = !!(pdoc && (pdoc.fullscreenElement || pdoc.webkitFullscreenElement));
         if (isFs) return;
+      } catch(e) {}
 
-        const el = document.body || document.documentElement;
-        const fn = el.requestFullscreen || el.webkitRequestFullscreen || el.webkitEnterFullscreen;
-        if (fn) fn.call(el);
+      try {
+        const fe = window.frameElement;
+        if (!fe) return;
+        const req = fe.requestFullscreen || fe.webkitRequestFullscreen;
+        if (req) req.call(fe);
+      } catch(e) {}
+
+      // Best-effort orientation lock on platforms that support it (Android Chrome)
+      try {
+        const isPortrait = (window.innerHeight >= window.innerWidth);
+        if (screen.orientation && screen.orientation.lock) {
+          screen.orientation.lock(isPortrait ? 'portrait' : 'landscape').catch(function(){});
+        }
       } catch(e) {}
     };
 
-    // Every tap tries to enter fullscreen if not already.
-    // If user exits fullscreen, next tap re-enters.
-    document.addEventListener('pointerdown', requestSafeFullscreen, { passive: true, capture: true });
-    document.addEventListener('touchstart', requestSafeFullscreen, { passive: true, capture: true });
+    // Auto-enter fullscreen on first gesture (keeps UX "just tap and play")
+    let __p2pFsTried = false;
+    const __p2pMaybeFs = function() {
+      if (__p2pFsTried) return;
+      __p2pFsTried = true;
+      requestFrameFullscreen();
+    };
+    document.addEventListener('pointerdown', __p2pMaybeFs, { passive: true, capture: true });
+    document.addEventListener('touchstart', __p2pMaybeFs, { passive: true, capture: true });
+
+    // Redirect in-game fullscreen calls to the iframe element fullscreen
+    const __p2pPatchReq = function(name) {
+      try {
+        const orig = Element.prototype[name];
+        if (typeof orig !== 'function') return;
+        Element.prototype[name] = function() {
+          requestFrameFullscreen();
+          return Promise.resolve();
+        };
+      } catch(e) {}
+    };
+    __p2pPatchReq('requestFullscreen');
+    __p2pPatchReq('webkitRequestFullscreen');
+
+    // Redirect exitFullscreen to parent (if game tries to exit)
+    try {
+      const pdoc = parent && parent.document;
+      const docExit = (pdoc && (pdoc.exitFullscreen || pdoc.webkitExitFullscreen))
+        ? (pdoc.exitFullscreen || pdoc.webkitExitFullscreen)
+        : null;
+      if (docExit) {
+        document.exitFullscreen = function() {
+          try { return docExit.call(pdoc); } catch(e) { return Promise.resolve(); }
+        };
+        document.webkitExitFullscreen = document.exitFullscreen;
+      }
+    } catch(e) {}
   } catch(e) {}
+
 })();
 <\/script>`;
 
@@ -1041,100 +1049,29 @@
         sendInput({ kind: 'cursor', visible: true, x, y, device });
       };
 
-      // --- Tap detection for touch (pulse only on TAP, not on touch contact) ---
-      const TAP_MAX_MS = 350;
-      const TAP_MAX_MOVE = 12; // px
-      const tapRef = { active: false, x: 0, y: 0, t: 0 };
-
       const onLeave = () => {
-        tapRef.active = false;
         sendInput({ kind: 'cursor', visible: false, x: 0.5, y: 0.5, device: 'mouse' });
       };
 
-      // Prefer Pointer Events if available (covers most modern browsers, incl. new iOS Safari)
       const hasPointer = !!win.PointerEvent;
 
-      // Pointer handlers
       const onPointerMove = (e) => {
+        // Only mouse/pen cursor is visualized on host
         if (e.pointerType === 'mouse' || e.pointerType === 'pen') {
           sendCursor(e.clientX, e.clientY, e.pointerType);
         }
       };
 
-      const onPointerDown = (e) => {
-        if (e.pointerType === 'touch') {
-          tapRef.active = true;
-          tapRef.x = e.clientX;
-          tapRef.y = e.clientY;
-          tapRef.t = performance.now();
-          return; // DO NOT send click here (touch contact)
-        }
-        const { x, y } = norm(e.clientX, e.clientY);
-        sendInput({ kind: 'click', x, y, device: e.pointerType || 'pointer', button: e.button });
-      };
-
-      const onPointerUp = (e) => {
-        if (e.pointerType !== 'touch') return;
-        if (!tapRef.active) return;
-        tapRef.active = false;
-
-        const dt = performance.now() - tapRef.t;
-        const dx = e.clientX - tapRef.x;
-        const dy = e.clientY - tapRef.y;
-
-        if (dt <= TAP_MAX_MS && (dx * dx + dy * dy) <= (TAP_MAX_MOVE * TAP_MAX_MOVE)) {
-          const { x, y } = norm(e.clientX, e.clientY);
-          sendInput({ kind: 'click', x, y, device: 'touch' });
-        }
-      };
-
-      const onPointerCancel = () => { tapRef.active = false; };
-
-      // Touch fallback (older browsers without PointerEvent)
-      const onTouchStart = (e) => {
-        const t = e.touches && e.touches[0];
-        if (!t) return;
-        tapRef.active = true;
-        tapRef.x = t.clientX;
-        tapRef.y = t.clientY;
-        tapRef.t = performance.now();
-      };
-
-      const onTouchEnd = (e) => {
-        if (!tapRef.active) return;
-        tapRef.active = false;
-
-        const t = (e.changedTouches && e.changedTouches[0]) || null;
-        if (!t) return;
-
-        const dt = performance.now() - tapRef.t;
-        const dx = t.clientX - tapRef.x;
-        const dy = t.clientY - tapRef.y;
-
-        if (dt <= TAP_MAX_MS && (dx * dx + dy * dy) <= (TAP_MAX_MOVE * TAP_MAX_MOVE)) {
-          const { x, y } = norm(t.clientX, t.clientY);
-          sendInput({ kind: 'click', x, y, device: 'touch' });
-        }
-      };
-
       const onMouseMove = (e) => sendCursor(e.clientX, e.clientY, 'mouse');
-      const onMouseDown = (e) => {
-        const { x, y } = norm(e.clientX, e.clientY);
-        sendInput({ kind: 'click', x, y, device: 'mouse', button: e.button });
-      };
 
       // capture=true to catch even if game stops propagation
       if (hasPointer) {
         doc.addEventListener('pointermove', onPointerMove, { passive: true, capture: true });
-        doc.addEventListener('pointerdown', onPointerDown, { passive: true, capture: true });
-        doc.addEventListener('pointerup', onPointerUp, { passive: true, capture: true });
-        doc.addEventListener('pointercancel', onPointerCancel, { passive: true, capture: true });
+        doc.addEventListener('pointerleave', onLeave, { passive: true, capture: true });
+        doc.addEventListener('pointercancel', onLeave, { passive: true, capture: true });
       } else {
         doc.addEventListener('mousemove', onMouseMove, { passive: true, capture: true });
-        doc.addEventListener('mousedown', onMouseDown, { passive: true, capture: true });
-        doc.addEventListener('touchstart', onTouchStart, { passive: true, capture: true });
-        doc.addEventListener('touchend', onTouchEnd, { passive: true, capture: true });
-        doc.addEventListener('touchcancel', onLeave, { passive: true, capture: true });
+        doc.addEventListener('mouseleave', onLeave, { passive: true, capture: true });
       }
 
       win.addEventListener('blur', onLeave, { passive: true });
@@ -1142,15 +1079,11 @@
       return () => {
         if (hasPointer) {
           doc.removeEventListener('pointermove', onPointerMove, true);
-          doc.removeEventListener('pointerdown', onPointerDown, true);
-          doc.removeEventListener('pointerup', onPointerUp, true);
-          doc.removeEventListener('pointercancel', onPointerCancel, true);
+          doc.removeEventListener('pointerleave', onLeave, true);
+          doc.removeEventListener('pointercancel', onLeave, true);
         } else {
           doc.removeEventListener('mousemove', onMouseMove, true);
-          doc.removeEventListener('mousedown', onMouseDown, true);
-          doc.removeEventListener('touchstart', onTouchStart, true);
-          doc.removeEventListener('touchend', onTouchEnd, true);
-          doc.removeEventListener('touchcancel', onLeave, true);
+          doc.removeEventListener('mouseleave', onLeave, true);
         }
         win.removeEventListener('blur', onLeave);
       };
@@ -1188,6 +1121,7 @@
             ref={iframeRef}
             src="game/index.html"
             className="w-full h-full border-0 block"
+            allowFullScreen
             allow="autoplay; fullscreen; gamepad; accelerometer; gyroscope"
             onLoad={handleGameLoaded}
           />
