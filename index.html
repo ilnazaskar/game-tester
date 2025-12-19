@@ -20,29 +20,7 @@
 <script type="text/babel">
   const { useState, useEffect, useRef, useMemo } = React;
 
-  const ICE_SERVERS = [
-    // Public STUN servers (no TURN)
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' },
-    { urls: 'stun:global.stun.twilio.com:3478' }
-  ];
-
-  const PEER_OPTS = {
-    debug: 1,
-    // PeerJS Cloud (WSS/HTTPS) — avoids ws:// quirks on iOS/in-app browsers
-    host: '0.peerjs.com',
-    port: 443,
-    path: '/',
-    secure: true,
-    config: {
-      iceServers: ICE_SERVERS,
-      iceCandidatePoolSize: 4
-    }
-  };
-
-  const createPeer = (id) => (id ? new Peer(id, PEER_OPTS) : new Peer(PEER_OPTS));
-
+  const createPeer = (id) => new Peer(id, { debug: 1 });
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   const clamp01 = (v) => Math.max(0, Math.min(1, v));
 
@@ -154,7 +132,7 @@
 
     const [logs, setLogs] = useState([]);
     const [cursor, setCursor] = useState({ visible: false, x: 0.5, y: 0.5, device: 'mouse' });
-    const peerRef = useRef(null);
+const peerRef = useRef(null);
     const connRef = useRef(null);
     const videoRef = useRef(null);
     const zipFileRef = useRef(null);
@@ -171,17 +149,6 @@
       const peer = createPeer(id);
       peerRef.current = peer;
 
-      peer.on('error', (err) => {
-        console.warn('[PeerJS] host error', err);
-        const msg = (err && (err.type || err.name)) ? (err.type || err.name) : 'unknown';
-        const details = err && err.message ? `: ${err.message}` : '';
-        setStatusMsg(`Peer error (${msg})${details}`);
-      });
-
-      peer.on('disconnected', () => {
-        try { peer.reconnect(); } catch (e) {}
-      });
-
       peer.on('open', (id) => {
         setPeerId(id);
         setStatusMsg('Ready. Select ZIP.');
@@ -189,13 +156,6 @@
 
       peer.on('connection', (conn) => {
         connRef.current = conn;
-
-        const connectWatchdog = setTimeout(() => {
-          if (!conn.open) {
-            setStatusMsg('Still connecting... Tip: on iPhone open in Safari and try Wi‑Fi. Without TURN some networks cannot do P2P.');
-          }
-        }, 8000);
-
         try { conn.binaryType = 'arraybuffer'; } catch (e) {}
 
         setStatusMsg('Tester connected!');
@@ -251,15 +211,7 @@
 
       peer.on('call', (call) => {
         call.answer(null);
-        call.on('error', (err) => console.warn('[PeerJS] media error', err));
-        call.on('close', () => setRemoteStream(null));
         call.on('stream', (stream) => {
-          // Grab dimensions early (helps correct letterboxing before <video> metadata updates)
-          try {
-            const vt = stream?.getVideoTracks?.()[0];
-            const s = vt?.getSettings?.() || {};
-            if (s.width && s.height) setVideoMeta({ vw: s.width, vh: s.height });
-          } catch (e) {}
           setRemoteStream(stream);
           setStatusMsg('Receiving stream...');
         });
@@ -313,7 +265,7 @@
       const py = contentRect.y + cursor.y * contentRect.h;
       return { transform: `translate(${px}px, ${py}px) translate(-50%, -50%)` };
     }, [cursor, contentRect]);
-    const handleFile = async (e) => {
+const handleFile = async (e) => {
       const file = e.target.files?.[0];
       if (!file) return;
 
@@ -441,16 +393,10 @@
                   <>
                     <video
                       ref={videoRef}
-                      className="absolute"
+                      className="w-full h-full object-contain"
                       autoPlay
                       playsInline
-                      style={{
-                        left: contentRect.x,
-                        top: contentRect.y,
-                        width: contentRect.w,
-                        height: contentRect.h,
-                        objectFit: 'contain'
-                      }}
+                      style={{ imageRendering: 'crisp-edges' }}
                     />
 
                     {/* cursor */}
@@ -461,7 +407,7 @@
                       />
                     )}
                   </>
-) : (
+                ) : (
                   <div className="w-full h-full flex items-center justify-center text-gray-500 text-center text-sm">
                     <div>
                       <div className="text-4xl mb-2">📺</div>
@@ -561,44 +507,15 @@
     const lastCursorSendRef = useRef(0);
 
     useEffect(() => {
-      if (!window.RTCPeerConnection) {
-        setMsg('WebRTC is not supported in this browser. Please open the link in Safari.');
-        return;
-      }
       const peer = createPeer();
       peerRef.current = peer;
 
-      // iOS / in-app browsers: surface failures instead of staying on "Connecting..."
-      const peerOpenWatchdog = setTimeout(() => {
-        setMsg('Connecting... If you are on iPhone: open this link in Safari (not in-app browser). Try Wi‑Fi (some networks block P2P without TURN).');
-      }, 7000);
-
-      peer.on('error', (err) => {
-        console.warn('[PeerJS] tester error', err);
-        const msg = (err && (err.type || err.name)) ? (err.type || err.name) : 'unknown';
-        const details = err && err.message ? `: ${err.message}` : '';
-        setMsg(`Connection error (${msg})${details}`);
-      });
-
-      peer.on('disconnected', () => {
-        try { peer.reconnect(); } catch (e) {}
-      });
-
       peer.on('open', () => {
-        clearTimeout(peerOpenWatchdog);
-
-        const conn = peer.connect(hostId, { reliable: true, serialization: 'binary' });
+        const conn = peer.connect(hostId);
         connRef.current = conn;
         try { conn.binaryType = 'arraybuffer'; } catch (e) {}
 
-        const connectWatchdog = setTimeout(() => {
-          if (!conn.open) {
-            setMsg('Connecting... If you are on iPhone: open this link in Safari (not in-app browser). Try Wi‑Fi (some networks block P2P without TURN).');
-          }
-        }, 8000);
-
         conn.on('open', () => {
-          clearTimeout(connectWatchdog);
           try { conn.binaryType = 'arraybuffer'; } catch (e) {}
           setMsg('Connected! Waiting for data...');
         });
@@ -638,22 +555,10 @@
           }
         });
 
-        conn.on('error', (err) => {
-          clearTimeout(connectWatchdog);
-          console.warn('[PeerJS] data error', err);
-          const msg = (err && (err.type || err.name)) ? (err.type || err.name) : 'unknown';
-          const details = err && err.message ? `: ${err.message}` : '';
-          setMsg(`Connection error (${msg})${details}`);
-        });
-
-        conn.on('close', () => {
-          clearTimeout(connectWatchdog);
-          setMsg('Host disconnected');
-        });
+        conn.on('close', () => setMsg('Host disconnected'));
       });
 
       return () => {
-        clearTimeout(peerOpenWatchdog);
         try { peer.destroy(); } catch (e) {}
         peerRef.current = null;
         connRef.current = null;
@@ -740,7 +645,7 @@
           // - Safe internal SW register
           // - WebGL tweaks
           // - Console forwarder
-          // - Fullscreen redirect (fullscreen iframe element, keeps current orientation)
+          // - Soft fullscreen (no forced orientation, uses body, re-enters on next tap)
           const patch = `
 <script>
 (function() {
@@ -829,70 +734,49 @@
       } catch(e) {}
     });
   } catch(e) {}
-  // --- Fullscreen redirect (keep current orientation, fullscreen the iframe element) ---
+
+  // --- Soft fullscreen (keep current orientation; best-effort) ---
   try {
-    const requestFrameFullscreen = function() {
+    const getDesiredOrientation = () => {
       try {
-        const pdoc = parent && parent.document;
-        const isFs = !!(pdoc && (pdoc.fullscreenElement || pdoc.webkitFullscreenElement));
-        if (isFs) return;
-      } catch(e) {}
-
-      try {
-        const fe = window.frameElement;
-        if (!fe) return;
-        const req = fe.requestFullscreen || fe.webkitRequestFullscreen;
-        if (req) req.call(fe);
-      } catch(e) {}
-
-      // Best-effort orientation lock on platforms that support it (Android Chrome)
-      try {
-        const isPortrait = (window.innerHeight >= window.innerWidth);
-        if (screen.orientation && screen.orientation.lock) {
-          screen.orientation.lock(isPortrait ? 'portrait' : 'landscape').catch(function(){});
-        }
-      } catch(e) {}
-    };
-
-    // Auto-enter fullscreen on first gesture (keeps UX "just tap and play")
-    let __p2pFsTried = false;
-    const __p2pMaybeFs = function() {
-      if (__p2pFsTried) return;
-      __p2pFsTried = true;
-      requestFrameFullscreen();
-    };
-    document.addEventListener('pointerdown', __p2pMaybeFs, { passive: true, capture: true });
-    document.addEventListener('touchstart', __p2pMaybeFs, { passive: true, capture: true });
-
-    // Redirect in-game fullscreen calls to the iframe element fullscreen
-    const __p2pPatchReq = function(name) {
-      try {
-        const orig = Element.prototype[name];
-        if (typeof orig !== 'function') return;
-        Element.prototype[name] = function() {
-          requestFrameFullscreen();
-          return Promise.resolve();
-        };
-      } catch(e) {}
-    };
-    __p2pPatchReq('requestFullscreen');
-    __p2pPatchReq('webkitRequestFullscreen');
-
-    // Redirect exitFullscreen to parent (if game tries to exit)
-    try {
-      const pdoc = parent && parent.document;
-      const docExit = (pdoc && (pdoc.exitFullscreen || pdoc.webkitExitFullscreen))
-        ? (pdoc.exitFullscreen || pdoc.webkitExitFullscreen)
-        : null;
-      if (docExit) {
-        document.exitFullscreen = function() {
-          try { return docExit.call(pdoc); } catch(e) { return Promise.resolve(); }
-        };
-        document.webkitExitFullscreen = document.exitFullscreen;
+        return (window.innerHeight >= window.innerWidth) ? 'portrait' : 'landscape';
+      } catch (e) {
+        return 'portrait';
       }
-    } catch(e) {}
-  } catch(e) {}
+    };
 
+    const requestSafeFullscreen = function() {
+      try {
+        const isFs = !!(document.fullscreenElement || document.webkitFullscreenElement);
+        if (isFs) return;
+
+        const el = document.documentElement || document.body;
+        const fn = el.requestFullscreen || el.webkitRequestFullscreen;
+        if (!fn) return;
+
+        const desired = getDesiredOrientation();
+
+        const after = () => {
+          try {
+            const o = screen && screen.orientation;
+            if (o && o.lock) o.lock(desired).catch(() => {});
+          } catch (e) {}
+        };
+
+        const res = fn.call(el);
+        if (res && typeof res.then === 'function') {
+          res.then(after).catch(() => {});
+        } else {
+          setTimeout(after, 0);
+        }
+      } catch (e) {}
+    };
+
+    // Click is the most reliable "user gesture" trigger on mobile.
+    document.addEventListener('click', requestSafeFullscreen, { capture: true });
+    document.addEventListener('pointerdown', requestSafeFullscreen, { capture: true });
+    document.addEventListener('touchend', requestSafeFullscreen, { capture: true });
+  } catch (e) {}
 })();
 <\/script>`;
 
@@ -967,24 +851,21 @@
     const startStreaming = async () => {
       if (!peerRef.current) return;
 
-      // 1) Prefer canvas.captureStream (no screen-share prompt).
-      //    Retry a bit: many games create the <canvas> shortly after iframe load.
+      // 1) Prefer canvas.captureStream everywhere
       try {
-        for (let i = 0; i < 40; i++) { // ~8s
-          const iframe = iframeRef.current;
-          const doc = iframe?.contentDocument || iframe?.contentWindow?.document;
-          const canvas = doc ? doc.querySelector('canvas') : null;
-
+        const iframe = iframeRef.current;
+        const doc = iframe?.contentDocument || iframe?.contentWindow?.document;
+        if (doc) {
+          const canvas = doc.querySelector('canvas');
           if (canvas && canvas.captureStream) {
             const stream = canvas.captureStream(60);
             await placeCallWithBitrate(stream);
             return;
           }
-          await sleep(200);
         }
       } catch (e) {}
 
-      // 2) Fallback (desktop): ask user to share tab/screen
+      // 2) Fallback (desktop)
       if (navigator.mediaDevices?.getDisplayMedia) {
         try {
           const stream = await navigator.mediaDevices.getDisplayMedia({
@@ -996,14 +877,8 @@
           if (vt) vt.addEventListener('ended', () => callRef.current && callRef.current.close());
 
           await placeCallWithBitrate(stream);
-          return;
-        } catch (e) {
-          console.warn('[Stream] getDisplayMedia failed', e);
-        }
+        } catch (e) {}
       }
-
-      // 3) No supported capture method (common in iOS in-app browsers)
-      console.warn('[Stream] No capture method available (need canvas.captureStream or getDisplayMedia).');
     };
 
     // Receive logs from iframe via postMessage
@@ -1038,54 +913,37 @@
       const norm = (clientX, clientY) => {
         const w = win.innerWidth || 1;
         const h = win.innerHeight || 1;
-        return { x: clamp01(clientX / w), y: clamp01(clientY / h) };
+        return {
+          x: clamp01(clientX / w),
+          y: clamp01(clientY / h),
+        };
       };
 
       const sendCursor = (clientX, clientY, device = 'mouse') => {
         const now = performance.now();
         if (now - lastCursorSendRef.current < 16) return; // ~60fps
         lastCursorSendRef.current = now;
+
         const { x, y } = norm(clientX, clientY);
         sendInput({ kind: 'cursor', visible: true, x, y, device });
       };
 
-      const onLeave = () => {
-        sendInput({ kind: 'cursor', visible: false, x: 0.5, y: 0.5, device: 'mouse' });
-      };
-
-      const hasPointer = !!win.PointerEvent;
-
       const onPointerMove = (e) => {
-        // Only mouse/pen cursor is visualized on host
         if (e.pointerType === 'mouse' || e.pointerType === 'pen') {
           sendCursor(e.clientX, e.clientY, e.pointerType);
         }
       };
-
-      const onMouseMove = (e) => sendCursor(e.clientX, e.clientY, 'mouse');
+      const onLeave = () => {
+        sendInput({ kind: 'cursor', visible: false, x: 0.5, y: 0.5, device: 'mouse' });
+      };
 
       // capture=true to catch even if game stops propagation
-      if (hasPointer) {
-        doc.addEventListener('pointermove', onPointerMove, { passive: true, capture: true });
-        doc.addEventListener('pointerleave', onLeave, { passive: true, capture: true });
-        doc.addEventListener('pointercancel', onLeave, { passive: true, capture: true });
-      } else {
-        doc.addEventListener('mousemove', onMouseMove, { passive: true, capture: true });
-        doc.addEventListener('mouseleave', onLeave, { passive: true, capture: true });
-      }
-
-      win.addEventListener('blur', onLeave, { passive: true });
+      doc.addEventListener('pointermove', onPointerMove, { passive: true, capture: true });
+win.addEventListener('blur', onLeave, { passive: true });
 
       return () => {
-        if (hasPointer) {
-          doc.removeEventListener('pointermove', onPointerMove, true);
-          doc.removeEventListener('pointerleave', onLeave, true);
-          doc.removeEventListener('pointercancel', onLeave, true);
-        } else {
-          doc.removeEventListener('mousemove', onMouseMove, true);
-          doc.removeEventListener('mouseleave', onLeave, true);
-        }
-        win.removeEventListener('blur', onLeave);
+        doc.removeEventListener('pointermove', onPointerMove, true);
+win.removeEventListener('blur', onLeave);
       };
     };
 
@@ -1121,8 +979,8 @@
             ref={iframeRef}
             src="game/index.html"
             className="w-full h-full border-0 block"
-            allowFullScreen
             allow="autoplay; fullscreen; gamepad; accelerometer; gyroscope"
+            allowFullScreen
             onLoad={handleGameLoaded}
           />
         </div>
