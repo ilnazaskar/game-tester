@@ -914,28 +914,64 @@
         try {
           msg = (r && r.stack) ? r.stack : (typeof r === 'string' ? r : JSON.stringify(r));
         } catch(e) { try { msg = String(r); } catch(e2) { msg = '[unserializable rejection]'; } }
+        
+        // Suppress noisy Construct / browser permission check rejections
+        try {
+          const low = String(msg || '').toLowerCase();
+          if (low.includes('permissions check failed')) {
+            try { ev && ev.preventDefault && ev.preventDefault(); } catch(e) {}
+            return;
+          }
+        } catch(e) {}
         send('error', ['UnhandledRejection', msg]);
       } catch(e) {}
     });
   } catch(e) {}
 
-  // --- Soft fullscreen (NO forced orientation) ---
+  // --- Block game-driven fullscreen + forced orientation (Construct sometimes toggles/rotates on extra taps) ---
+  // We control fullscreen from the outer wrapper. Inside the iframe we only want gameplay taps.
   try {
-    const requestSafeFullscreen = function() {
-      try {
-        const isFs = !!(document.fullscreenElement || document.webkitFullscreenElement);
-        if (isFs) return;
+    // 1) Block requestFullscreen calls from inside the game (avoid Construct toggling/rotating fallback)
+    const blockFS = function() { return Promise.resolve(); };
 
-        const el = document.body || document.documentElement;
-        const fn = el.requestFullscreen || el.webkitRequestFullscreen || el.webkitEnterFullscreen;
-        if (fn) fn.call(el);
-      } catch(e) {}
-    };
+    try {
+      const proto = (window.HTMLElement && window.HTMLElement.prototype) || (window.Element && window.Element.prototype);
+      if (proto) {
+        if (proto.requestFullscreen) proto.requestFullscreen = blockFS;
+        if (proto.webkitRequestFullscreen) proto.webkitRequestFullscreen = blockFS;
+        if (proto.webkitEnterFullscreen) proto.webkitEnterFullscreen = blockFS;
+      }
+    } catch(e) {}
 
-    // Every tap tries to enter fullscreen if not already.
-    // If user exits fullscreen, next tap re-enters.
-    document.addEventListener('pointerdown', requestSafeFullscreen, { passive: true, capture: true });
-    document.addEventListener('touchstart', requestSafeFullscreen, { passive: true, capture: true });
+    try {
+      if (document.exitFullscreen) document.exitFullscreen = () => Promise.resolve();
+      if (document.webkitExitFullscreen) document.webkitExitFullscreen = () => Promise.resolve();
+    } catch(e) {}
+
+    // 2) Block orientation locks to a specific axis. Allow only "any"/"natural".
+    try {
+      const so = screen && screen.orientation;
+      if (so && so.lock) {
+        const origLock = so.lock.bind(so);
+        so.lock = function(mode) {
+          try {
+            const m = String(mode || '').toLowerCase();
+            if (!m || m === 'any' || m === 'natural') {
+              return origLock(mode).catch(() => Promise.resolve());
+            }
+            // swallow "portrait"/"landscape" locks
+            return Promise.resolve();
+          } catch(e) { return Promise.resolve(); }
+        };
+      }
+    } catch(e) {}
+
+    // Legacy APIs
+    try { if (screen && screen.lockOrientation) screen.lockOrientation = () => true; } catch(e) {}
+    try { if (screen && screen.unlockOrientation) screen.unlockOrientation = () => true; } catch(e) {}
+  } catch(e) {}
+
+
   } catch(e) {}
 })();
 <\/script>`;
