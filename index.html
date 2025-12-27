@@ -1221,36 +1221,39 @@
           script.textContent = `
             (function(){
               function isFullscreen(d){
-                return !!(d.fullscreenElement || d.webkitFullscreenElement);
+                return !!(d && (d.fullscreenElement || d.webkitFullscreenElement));
               }
+
               function requestSafeFullscreen(){
-                try {
-                  var topWin = window.top;
-                  var topDoc = topWin && topWin.document;
-                  if (topDoc && isFullscreen(topDoc)) return;
-                  if (isFullscreen(document)) return;
+                var topWin = window.top || window;
+                var topDoc = topWin && topWin.document;
+                if (topDoc && isFullscreen(topDoc)) return;
+                if (isFullscreen(document)) return;
 
-                  // Best effort: scroll a tiny bit to encourage UI collapse on mobile
-                  try { (topWin || window).scrollTo(0, 1); } catch(e){}
+                // Encourage mobile UI collapse
+                var sc = topWin && topWin.scrollTo ? topWin.scrollTo.bind(topWin) : (window.scrollTo ? window.scrollTo.bind(window) : null);
+                if (sc) sc(0, 1);
 
-                  var el = (topDoc && (topDoc.documentElement || topDoc.body)) || (document.documentElement || document.body);
-                  var fn = el.requestFullscreen || el.webkitRequestFullscreen;
-                  if (fn) fn.call(el);
+                var el = (topDoc && (topDoc.documentElement || topDoc.body)) || (document.documentElement || document.body);
+                if (!el) return;
 
-                  // Do NOT lock orientation. User controls it by rotating device.
-                  // If browser supports it and wants stabilization, allow any/natural (ignored if unsupported)
-                  try {
-                    var so = (topWin && topWin.screen && topWin.screen.orientation) || (screen && screen.orientation);
-                    if (so && so.lock) { so.lock('any').catch(function(){}); }
-                  } catch(e){}
-                } catch(e){}
+                var fn = el.requestFullscreen || el.webkitRequestFullscreen;
+                if (fn) fn.call(el);
+
+                // Best-effort orientation stabilization: allow user-controlled orientation.
+                // Avoid using Promise.catch (some environments choke on it).
+                var so = (topWin && topWin.screen && topWin.screen.orientation) || (screen && screen.orientation);
+                if (so && so.lock) {
+                  var p = so.lock('any');
+                  if (p && p.then) p.then(function(){}, function(){});
+                }
               }
 
-              // Must be called from a user gesture
               document.addEventListener('pointerdown', requestSafeFullscreen, {passive:true, capture:true});
               document.addEventListener('touchend', requestSafeFullscreen, {passive:true, capture:true});
               document.addEventListener('click', requestSafeFullscreen, {passive:true, capture:true});
             })();
+          
           `;
           doc.documentElement.appendChild(script);
         }
