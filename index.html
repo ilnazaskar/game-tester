@@ -1180,7 +1180,7 @@
     const handleGameLoaded = () => {
       // attach inputs
       if (cleanupInputRef.current) {
-        try { cleanupInputRef.current(); } catch {}
+        try { cleanupInputRef.current(); } catch (e) {}
         cleanupInputRef.current = null;
       }
       cleanupInputRef.current = attachInputListenersInsideIframe();
@@ -1264,7 +1264,7 @@
     useEffect(() => {
       return () => {
         if (cleanupInputRef.current) {
-          try { cleanupInputRef.current(); } catch {}
+          try { cleanupInputRef.current(); } catch (e) {}
           cleanupInputRef.current = null;
         }
         if (flushTimerRef.current) {
