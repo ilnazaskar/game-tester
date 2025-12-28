@@ -64,30 +64,100 @@
 <script type="text/babel">
   const { useState, useEffect, useRef, useMemo } = React;
 
-  const ICE_SERVERS = [
-    // Public STUN servers (no TURN)
+  // =========================
+  // ICE servers (STUN + TURN fallback)
+  // TURN creds are generated in-browser using coturn 'static-auth-secret' (long-term creds).
+  // If you want to keep the secret private, mint short-lived creds on your Worker instead.
+  const STUN_SERVERS = [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun2.l.google.com:19302' },
     { urls: 'stun:global.stun.twilio.com:3478' }
   ];
 
-  const PEER_OPTS = {
+  // === Your coturn (no TLS) ===
+  const TURN_HOST = '82.26.171.217';
+  const TURN_PORT = 3478;
+  const TURN_SECRET = 'MySecretKey2025ABC';
+  const TURN_TTL_SECONDS = 3600;
+
+  const _textEnc = new TextEncoder();
+  const _abToB64 = (ab) => {
+    const bytes = new Uint8Array(ab);
+    let bin = '';
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+  };
+
+  async function _hmacSha1Base64(secret, message) {
+    const key = await crypto.subtle.importKey(
+      'raw',
+      _textEnc.encode(secret),
+      { name: 'HMAC', hash: 'SHA-1' },
+      false,
+      ['sign']
+    );
+    const sig = await crypto.subtle.sign('HMAC', key, _textEnc.encode(message));
+    return _abToB64(sig);
+  }
+
+  async function _getTurnCreds(ttlSeconds = TURN_TTL_SECONDS) {
+    const username = `${Math.floor(Date.now() / 1000) + ttlSeconds}:tester`;
+    const credential = await _hmacSha1Base64(TURN_SECRET, username);
+    return { username, credential };
+  }
+
+  let _iceServersPromise = null;
+  async function getIceServers() {
+    if (_iceServersPromise) return _iceServersPromise;
+
+    _iceServersPromise = (async () => {
+      const servers = [...STUN_SERVERS];
+
+      try {
+        if (!window.crypto || !window.crypto.subtle) throw new Error('WebCrypto unavailable (need https or localhost)');
+        const { username, credential } = await _getTurnCreds();
+        servers.push({
+          urls: [
+            `turn:${TURN_HOST}:${TURN_PORT}?transport=udp`,
+            `turn:${TURN_HOST}:${TURN_PORT}?transport=tcp`
+          ],
+          username,
+          credential
+        });
+        console.log('[TURN] enabled (fallback)', { host: TURN_HOST, port: TURN_PORT });
+      } catch (e) {
+        console.warn('[TURN] disabled:', e && e.message ? e.message : e);
+      }
+
+      return servers;
+    })();
+
+    return _iceServersPromise;
+  }
+
+const PEER_BASE_OPTS = {
     debug: 1,
     // PeerJS Cloud (WSS/HTTPS) — avoids ws:// quirks on iOS/in-app browsers
     host: '0.peerjs.com',
     port: 443,
     path: '/',
-    secure: true,
-    config: {
-      iceServers: ICE_SERVERS,
-      iceCandidatePoolSize: 4
-    }
+    secure: true
   };
 
-  const createPeer = (id) => (id ? new Peer(id, PEER_OPTS) : new Peer(PEER_OPTS));
+  const createPeer = async (id) => {
+    const iceServers = await getIceServers();
+    const opts = {
+      ...PEER_BASE_OPTS,
+      config: {
+        iceServers,
+        iceCandidatePoolSize: 4
+      }
+    };
+    return id ? new Peer(id, opts) : new Peer(opts);
+  };
 
-  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   const clamp01 = (v) => Math.max(0, Math.min(1, v));
 
   // =========================
@@ -212,8 +282,13 @@
 
     useEffect(() => {
       const id = Math.random().toString(36).substring(2, 10);
-      const peer = createPeer(id);
-      peerRef.current = peer;
+      let peer = null;
+      let cancelled = false;
+
+      (async () => {
+        peer = await createPeer(id);
+        if (cancelled) { try { peer.destroy(); } catch (e) {} return; }
+        peerRef.current = peer;
 
       peer.on('error', (err) => {
         console.warn('[PeerJS] host error', err);
@@ -309,8 +384,11 @@
         });
       });
 
+      })();
+
       return () => {
-        try { peer.destroy(); } catch (e) {}
+        cancelled = true;
+        try { peer && peer.destroy(); } catch (e) {}
         peerRef.current = null;
         connRef.current = null;
       };
@@ -647,8 +725,13 @@
         setMsg('WebRTC is not supported in this browser. Please open the link in Safari.');
         return;
       }
-      const peer = createPeer();
-      peerRef.current = peer;
+      let peer = null;
+      let cancelled = false;
+
+      (async () => {
+        peer = await createPeer();
+        if (cancelled) { try { peer.destroy(); } catch (e) {} return; }
+        peerRef.current = peer;
 
       // iOS / in-app browsers: surface failures instead of staying on "Connecting..."
       const peerOpenWatchdog = setTimeout(() => {
@@ -734,7 +817,10 @@
         });
       });
 
+      })();
+
       return () => {
+        cancelled = true;
         try {
           window.removeEventListener('resize', onResize);
           window.removeEventListener('orientationchange', onResize);
@@ -743,7 +829,7 @@
         removeTesterMode();
 
         clearTimeout(peerOpenWatchdog);
-        try { peer.destroy(); } catch (e) {}
+        try { peer && peer.destroy(); } catch (e) {}
         peerRef.current = null;
         connRef.current = null;
       };
@@ -1180,7 +1266,7 @@
     const handleGameLoaded = () => {
       // attach inputs
       if (cleanupInputRef.current) {
-        try { cleanupInputRef.current(); } catch (e) {}
+        try { cleanupInputRef.current(); } catch {}
         cleanupInputRef.current = null;
       }
       cleanupInputRef.current = attachInputListenersInsideIframe();
@@ -1264,7 +1350,7 @@
     useEffect(() => {
       return () => {
         if (cleanupInputRef.current) {
-          try { cleanupInputRef.current(); } catch (e) {}
+          try { cleanupInputRef.current(); } catch {}
           cleanupInputRef.current = null;
         }
         if (flushTimerRef.current) {
